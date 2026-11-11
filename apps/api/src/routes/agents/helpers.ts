@@ -87,6 +87,7 @@ import { isParkedDevice } from '../../services/unassignedPool/deliveryEligibilit
 import { checkDeviceRemoteToolsPolicy } from '../../services/aiRemoteToolsPolicy';
 import { recordFilesystemAutoTriggerSkipped, type FilesystemAutoTrigger } from '../../services/filesystemAnalysisPolicyMetrics';
 import { getBinaryEdition } from '../../services/binaryEdition';
+import { isUpgradeTargetServable } from '../../services/localBinaryBuild';
 import { redactSecretsDeep, redactOptionalSecretText } from '../../services/secretRedaction';
 import { CloudflareMtlsService, parseIssuedLeafCertificate } from '../../services/cloudflareMtls';
 import { recordIssuedCertificateForDevice, revokeInlineAfterContextExit } from '../../services/deviceMtlsCertificateIssuance';
@@ -289,6 +290,11 @@ export function normalizeProvider(raw: unknown): SecurityProviderValue {
     // CylancePROTECT, rebranded Aurora Endpoint Defense (#9178).
     case 'cylance':
       return 'cylance';
+    // Trend Micro Apex One / Worry-Free / Vision One (#8171).
+    case 'trend_micro':
+    case 'trendmicro':
+    case 'trend-micro':
+      return 'trend_micro';
     case 'unknown':
       return 'unknown';
     default:
@@ -2168,6 +2174,7 @@ export interface EventLogSettings {
   minimumLevel: EventLogLevel;
   collectionIntervalMinutes: number;
   rateLimitPerHour: number;
+  applicationProviders: string[];
 }
 
 export const EVENT_LOG_DEFAULTS: EventLogSettings = {
@@ -2180,6 +2187,7 @@ export const EVENT_LOG_DEFAULTS: EventLogSettings = {
   // NewEventLogCollector default.
   collectionIntervalMinutes: 15,
   rateLimitPerHour: 12000,
+  applicationProviders: [],
 };
 
 const LEVEL_PRIORITY: Record<string, number> = {
@@ -2196,7 +2204,7 @@ const EVENT_LOG_APPLICABILITY: ApplicabilityRule = { ownership: 'orgOrPartner', 
 type EventLogRankRow = {
   level: string; assignmentPriority: number; roleFilter: readonly string[] | null; osFilter: readonly string[] | null;
   retentionDays: number; maxEventsPerCycle: number; collectCategories: string[]; minimumLevel: string;
-  collectionIntervalMinutes: number; rateLimitPerHour: number;
+  collectionIntervalMinutes: number; rateLimitPerHour: number; applicationProviders: string[];
 };
 
 function eventLogSettingsFromRows(rows: EventLogRankRow[], device: { deviceRole: string; osType: string }): EventLogSettings {
@@ -2212,6 +2220,7 @@ function eventLogSettingsFromRows(rows: EventLogRankRow[], device: { deviceRole:
     minimumLevel: winner.minimumLevel as EventLogLevel,
     collectionIntervalMinutes: winner.collectionIntervalMinutes,
     rateLimitPerHour: winner.rateLimitPerHour,
+    applicationProviders: winner.applicationProviders ?? [],
   };
 }
 
@@ -2226,6 +2235,7 @@ async function resolveDeviceEventLogSettings(deviceId: string, opts?: DevicePoli
           roleFilter: candidate.roleFilter, osFilter: candidate.osFilter,
           retentionDays: link.eventLog.retentionDays, maxEventsPerCycle: link.eventLog.maxEventsPerCycle,
           collectCategories: link.eventLog.collectCategories, minimumLevel: link.eventLog.minimumLevel,
+          applicationProviders: link.eventLog.applicationProviders,
           collectionIntervalMinutes: link.eventLog.collectionIntervalMinutes, rateLimitPerHour: link.eventLog.rateLimitPerHour,
         }]
         : []), set.hierarchy);
@@ -2293,6 +2303,7 @@ async function resolveDeviceEventLogSettings(deviceId: string, opts?: DevicePoli
       minimumLevel: configPolicyEventLogSettings.minimumLevel,
       collectionIntervalMinutes: configPolicyEventLogSettings.collectionIntervalMinutes,
       rateLimitPerHour: configPolicyEventLogSettings.rateLimitPerHour,
+      applicationProviders: configPolicyEventLogSettings.applicationProviders,
     })
     .from(configPolicyAssignments)
     .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
@@ -2342,6 +2353,7 @@ export async function buildEventLogConfigUpdate(deviceId: string, opts?: DeviceP
   collect_categories: string[];
   minimum_level: string;
   collection_interval_minutes: number;
+  application_providers: string[];
 }> {
   const settings = await getDeviceEventLogSettings(deviceId, opts);
 
@@ -2350,6 +2362,8 @@ export async function buildEventLogConfigUpdate(deviceId: string, opts?: DeviceP
     collect_categories: settings.collectCategories,
     minimum_level: settings.minimumLevel,
     collection_interval_minutes: settings.collectionIntervalMinutes,
+    // Cached settings from the previous release do not yet carry this field.
+    application_providers: settings.applicationProviders ?? [],
   };
 }
 
@@ -3376,7 +3390,7 @@ export async function resolvePinnedUpgradeTarget(args: {
       )
       .orderBy(desc(agentVersions.createdAt)) // newest first if multiple isLatest rows exist
       .limit(1);
-    return latest?.version ?? null;
+    return servableTargetOrNull(component, platform, architecture, latest?.version ?? null);
   }
 
   const [pinned] = await db
@@ -3404,7 +3418,25 @@ export async function resolvePinnedUpgradeTarget(args: {
     warnMissingPinnedBuild(component, platform, architecture, pin, agentId);
     return null;
   }
-  return pinned.version;
+  return servableTargetOrNull(component, platform, architecture, pinned.version);
+}
+
+/**
+ * #7516 — the last step of every offer resolution: a target whose bytes this
+ * server cannot serve (BINARY_SOURCE=local holding a different build) becomes
+ * null, i.e. no offer. Withholding at offer time, not refusing at download
+ * time: a 409 from the download would still have every device re-try it each
+ * heartbeat, while no offer costs nothing and self-heals the moment the
+ * promoted target and the local build agree.
+ */
+async function servableTargetOrNull(
+  component: string,
+  platform: string,
+  architecture: string,
+  version: string | null,
+): Promise<string | null> {
+  if (version === null) return null;
+  return (await isUpgradeTargetServable({ component, platform, architecture, version })) ? version : null;
 }
 
 export interface PinnedUpgradeRequest {
@@ -3455,12 +3487,13 @@ export async function resolvePinnedUpgradeTargets(args: {
 
   for (const request of requests) {
     if (request.pin === null) {
-      result.set(request.component, rows.find((r) => r.component === request.component && r.isLatest)?.version ?? null);
+      const latest = rows.find((r) => r.component === request.component && r.isLatest)?.version ?? null;
+      result.set(request.component, await servableTargetOrNull(request.component, platform, architecture, latest));
       continue;
     }
     const hit = rows.find((r) => r.component === request.component && r.version === request.pin);
     if (hit) {
-      result.set(request.component, hit.version);
+      result.set(request.component, await servableTargetOrNull(request.component, platform, architecture, hit.version));
       continue;
     }
     warnMissingPinnedBuild(request.component, platform, architecture, request.pin, agentId);

@@ -502,11 +502,26 @@ describe('get_unifi_status / trigger_unifi_sync', () => {
     expect(out.truncated).toBe(false);
   });
 
+  // W04 (#11504): the same MAC can be two rows (two controller sites), so a
+  // client row is only identifiable with its collector and controller site.
+  it('client rows include collectorId and localSiteId', async () => {
+    const { unifiClients } = await import('../db/schema');
+    h.svc.getConnection.mockResolvedValue(conn);
+    h.queue.push([{ id: SITE, orgId: ORG }], [], []);
+    await call('get_unifi_status', { action: 'telemetry', siteId: SITE }, partnerAuth());
+    const projections = h.db.select.mock.calls.map((args: unknown[]) => args[0] as Record<string, unknown> | undefined);
+    const clientProjection = projections.find((p) => p?.mac === unifiClients.mac);
+    expect(clientProjection).toBeDefined();
+    expect(clientProjection!.collectorId).toBe(unifiClients.collectorId);
+    expect(clientProjection!.localSiteId).toBe(unifiClients.localSiteId);
+  });
+
   it('hosts: a vendor failure is summarised, never relayed', async () => {
     h.svc.getConnection.mockResolvedValue(conn);
     h.svc.getDecryptedApiKey.mockResolvedValue('secret-key');
     h.svc.createUnifiClient.mockReturnValue({
       listHosts: vi.fn().mockRejectedValue(new Error('upstream said: Authorization: Bearer secret-key')),
+      listSitesForSync: vi.fn(async () => ({ sites: [], hostsWithDroppedRows: new Set<string>(), rowsWithoutHostId: 0 })),
       listSites: vi.fn().mockResolvedValue([]),
     });
     const out = await call('get_unifi_status', { action: 'hosts' }, partnerAuth());
@@ -520,6 +535,7 @@ describe('get_unifi_status / trigger_unifi_sync', () => {
     h.svc.getDecryptedApiKey.mockResolvedValue('k');
     const failing = (status: number) => h.svc.createUnifiClient.mockReturnValue({
       listHosts: vi.fn().mockRejectedValue(Object.assign(new UnifiApiError('body: secret-key', status), { status })),
+      listSitesForSync: vi.fn(async () => ({ sites: [], hostsWithDroppedRows: new Set<string>(), rowsWithoutHostId: 0 })),
       listSites: vi.fn().mockResolvedValue([]),
     });
     failing(401);
@@ -538,7 +554,7 @@ describe('get_unifi_status / trigger_unifi_sync', () => {
     expect(h.svc.listControllerSitesForIntegration).not.toHaveBeenCalled();
   });
 
-  it('hosts lists only consoles that have a mappable site', async () => {
+  it('hosts lists every host that has a site, whatever its type', async () => {
     h.svc.getConnection.mockResolvedValue(conn);
     h.svc.getDecryptedApiKey.mockResolvedValue('k');
     h.svc.createUnifiClient.mockReturnValue({
@@ -547,10 +563,15 @@ describe('get_unifi_status / trigger_unifi_sync', () => {
         { id: 'h2', name: 'No sites', model: 'UDM', type: 'console' },
         { id: 'h3', name: 'Cloud key', model: 'CK', type: 'cloudkey' },
       ]),
+      listSitesForSync: vi.fn(async () => ({ sites: [], hostsWithDroppedRows: new Set<string>(), rowsWithoutHostId: 0 })),
       listSites: vi.fn().mockResolvedValue([{ id: 's1', name: 'Main', hostId: 'h1' }, { id: 's3', name: 'x', hostId: 'h3' }]),
     });
     const out = await call('get_unifi_status', { action: 'hosts' }, partnerAuth());
-    expect(out.hosts).toEqual([{ id: 'h1', name: 'Console', model: 'UDM', sites: [{ id: 's1', name: 'Main' }] }]);
+    expect(out.hosts).toEqual([
+      { id: 'h1', name: 'Console', model: 'UDM', type: 'console', sites: [{ id: 's1', name: 'Main' }] },
+      { id: 'h3', name: 'Cloud key', model: 'CK', type: 'cloudkey', sites: [{ id: 's3', name: 'x' }] },
+    ]);
+    expect(out.omitted).toEqual({ hostsWithoutSites: 1, sitesWithoutHostId: 0 });
   });
 
   it('sync_runs projects the row shape (no partner or integration id)', async () => {

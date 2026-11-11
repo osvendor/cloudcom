@@ -9,6 +9,17 @@ import { TicketAttachmentList } from './TicketAttachments';
 
 const SYSTEM_TYPES = new Set(['status_change', 'assignment', 'system', 'time_entry']);
 
+/**
+ * #9960: a note Breeze posted itself (the deliverable instructions,
+ * awaiting-evidence and auto-evidence notes) renders as an ordinary internal
+ * comment card, but it has no author — never offer Edit/Delete on it. The API
+ * refuses the write too (409 SYSTEM_COMMENT_READ_ONLY); this keeps the
+ * controls from appearing at all, whatever `canManageComment` says.
+ */
+function isSystemAuthored(c: TicketComment): boolean {
+  return c.authorType === 'system' || c.originPrincipalKind === 'system';
+}
+
 type TFunction = ReturnType<typeof useTranslation>['t'];
 
 function systemLine(c: TicketComment, t: TFunction): string {
@@ -114,6 +125,8 @@ export default function TicketFeed({
     return <p className="px-4 py-8 text-center text-sm text-muted-foreground" data-testid="ticket-feed-empty">{t('ticketFeed.empty')}</p>;
   }
 
+  const canManage = (c: TicketComment): boolean => !isSystemAuthored(c) && Boolean(canManageComment?.(c));
+
   const openEditor = (id: string, content: string) => {
     setEditingId(id);
     setDraft(content);
@@ -152,7 +165,9 @@ export default function TicketFeed({
               key={b.item.id}
               className={cn(
                 'rounded-lg border p-3',
-                !b.item.isPublic && 'border-warning/30 bg-warning/10'
+                // The amber wash re-points muted ink at the foreground: grey
+                // --muted-foreground is 4.2–4.4:1 on it in light.
+                !b.item.isPublic && 'border-warning/30 bg-warning/10 [--muted-foreground:var(--foreground)_/_0.7]'
               )}
               data-testid={`ticket-comment-${b.item.id}`}
             >
@@ -165,14 +180,14 @@ export default function TicketFeed({
                       : t('ticketFeed.mergedFromUnknown')}
                   </span>
                 )}
-                {!b.item.isPublic && <span className="font-medium text-warning">{t('ticketFeed.internal')}</span>}
+                {!b.item.isPublic && <span className="font-medium text-warning-ink">{t('ticketFeed.internal')}</span>}
                 {b.item.editedAt && (
                   <span data-testid={`ticket-comment-edited-${b.item.id}`} title={formatDateTime(b.item.editedAt)}>{t('ticketFeed.edited')}</span>
                 )}
                 <span className="ml-auto" title={formatDateTime(b.item.createdAt)}>
                   {formatDateTime(b.item.createdAt, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                 </span>
-                {canManageComment?.(b.item) && onEditComment && (
+                {canManage(b.item) && onEditComment && (
                   <button
                     type="button"
                     className="text-xs hover:text-foreground"
@@ -182,7 +197,7 @@ export default function TicketFeed({
                     {t('common:actions.edit')}
                   </button>
                 )}
-                {canManageComment?.(b.item) && onDeleteComment && (
+                {canManage(b.item) && onDeleteComment && (
                   <button
                     type="button"
                     className="text-xs hover:text-destructive"
@@ -233,7 +248,7 @@ export default function TicketFeed({
                   ticketId={ticketId}
                   commentId={b.item.id}
                   attachments={b.item.attachments ?? []}
-                  canDelete={Boolean(onDeleteAttachment) && canManageComment?.(b.item)}
+                  canDelete={Boolean(onDeleteAttachment) && canManage(b.item)}
                   onDelete={onDeleteAttachment}
                 />
               )}

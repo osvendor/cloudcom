@@ -1,5 +1,5 @@
 import { flowBuiltinTierFor, isFlowBuiltin, isTenantToolName, remediationTriggerSchema, type RemediationTrigger, AI_APPROVAL_TIMEOUT_MAX_MINUTES, AI_APPROVAL_TIMEOUT_MIN_MINUTES } from '@breeze/shared';
-import { buildActionLabel, hasDeviceIdStub } from './actionLabel';
+import { buildActionLabel, describePax8Action, describePax8Submit, hasDeviceIdStub } from './actionLabel';
 import { argumentDeviceId, resolveApprovalDeviceName } from './approvalDeviceName';
 import { randomUUID, createHash } from 'crypto';
 import { and, eq, inArray, sql } from 'drizzle-orm';
@@ -38,6 +38,7 @@ import { aiTools, resolveWritableToolOrgId } from '../aiTools';
 import {
   checkAgentGuardrails,
   checkGuardrails,
+  needsRegistryTier3Approval,
   type AgentGuardrailPolicy,
   type GuardrailCheck,
   type GuardrailContext,
@@ -67,9 +68,11 @@ import {
   type IntentTargetScope,
   type ResolveIntentApproversDiagnostics,
 } from './intentApprovers';
+import { mayHavePartnerWideEffect, PARTNER_LEVEL_APPROVER_NOTE } from './partnerWideEffect';
 import { isSoleOperatorSelfApprovalForbidden } from './selfApprovalPolicy';
 import { computeEffectDigestOutcome, EffectDigestUnresolvableError, type EffectDigestOutcome } from './effectDigest';
 import { DIAGNOSE_CONNECTIVITY_TOOL_NAME, requiresPinnedEffectDigest } from './pinnedEffectPolicy';
+import { fleetApprovalScope } from '../flows/builtins/fleetApprovalScope';
 import {
   assertArgsMatchScope,
   assertArgsMatchTicketScope,
@@ -284,6 +287,13 @@ export interface CreateActionIntentInput {
    */
   maxLiveForOrigin?: number;
   /**
+   * #9758: the requester's `auth_epoch` the OAuth bearer middleware verified
+   * on the filing MCP call. REQUIRED for an MCP-origin `oauth_grant` intent
+   * (refused with `principal_not_supported` without a safe integer) and
+   * stored as `origin_auth_epoch`; ignored for every other origin.
+   */
+  originAuthEpoch?: number;
+  /**
    * B-W04 (#6158, D-B27): churn charge, invoked outside any DB context only
    * when a NEW row is about to be inserted (a live replay is never charged).
    * Throws ActionIntentError('rate_limited') to refuse. MCP-origin only.
@@ -353,9 +363,11 @@ export interface CreateActionIntentInput {
    * would answer tier 4 "unknown tool" for a qualified name. The external
    * tool is always Tier 3 / `supervised` here (Tier 1-2 external calls
    * auto-execute in-session and never mint an intent; the caller passes
-   * only Tier-3 descriptors). Chat/MCP principals only: an ai_agent
-   * principal is refused (`external_tool_not_allowed_for_agent`) — agents
-   * calling tenant tools is W5 work (flows-as-tools).
+   * only Tier-3 descriptors). Chat/MCP principals, and a flow principal
+   * parking its own Tier-3 external step (#10288 — the step row must be that
+   * tool, pinned Tier 3); an ai_agent principal is refused
+   * (`external_tool_not_allowed_for_agent`) — agents calling tenant tools is
+   * W5 work (flows-as-tools).
    */
   externalTool?: { toolSourceToolId: string; revision: string; sourceName: string };
   /**
@@ -410,6 +422,14 @@ export interface CreateActionIntentInput {
    * (W04) consumes — keep the field name.
    */
   guardrailContext?: GuardrailContext;
+  /**
+   * #10027: set only by `createMcpActionIntent` (source `mcp_api`). A call to
+   * a registry-Tier-3 tool whose action is rated below Tier 3 and is NOT
+   * read-only (`needsRegistryTier3Approval`) is then approved at Tier 3,
+   * supervised, instead of being refused as `tool_not_tier3`. It changes
+   * nothing for any other call. TRUSTED, INTERNAL-ONLY.
+   */
+  mcpRegistryTierApproval?: true;
 }
 
 export type ActionIntentSnapshot = {
@@ -626,8 +646,21 @@ const IMPACT_SUMMARY_BUILDERS: Record<string, (input: Record<string, unknown>) =
       default: return null;
     }
   },
+  // Full-control W17 (#6788).
+  manage_backup_verification: (input) =>
+    nonEmptyString(input.action) === 'run' ? 'Queues a backup check on the machine. It uses device and storage resources while it runs.' : null,
+  manage_c2c_configs: (input) => {
+    switch (nonEmptyString(input.action)) {
+      case 'create': return 'Chooses whose mail is copied, where it is stored and on what schedule.';
+      case 'update': return 'Changes whose mail is copied, where it is stored or on what schedule.';
+      case 'delete': return 'Deletes the config. Refused while backup history depends on it.';
+      default: return null;
+    }
+  },
   manage_quotes: (input) =>
     nonEmptyString(input.action) === 'send' ? 'Sends the quote to the customer.' : null,
+  manage_pax8_subscriptions: (input) => describePax8Action('manage_pax8_subscriptions', nonEmptyString(input.action)),
+  manage_pax8_orders: (input) => input.action === 'submit' ? describePax8Submit(input) : describePax8Action('manage_pax8_orders', nonEmptyString(input.action)),
   manage_contracts: (input) => {
     switch (nonEmptyString(input.action)) {
       case 'activate': return 'Activates the contract so billing starts.';
@@ -1339,8 +1372,10 @@ function triggerPolicyDecisionAttempt(intentId: string): void {
 function builtinGuardrailCheck(toolName: string, input: Record<string, unknown>): GuardrailCheck {
   const tier = flowBuiltinTierFor(toolName as Parameters<typeof flowBuiltinTierFor>[0], input);
   const description = `${toolName} — flow built-in step`;
+  // W6 (#5221): a fleet script step's scope follows the script (core run_script's classification).
+  const approvalScope = toolName === 'run_script_on_targets' ? fleetApprovalScope(input) : 'supervised';
   return tier === 3
-    ? { tier: 3, allowed: true, requiresApproval: true, readOnly: false, approvalScope: 'supervised', description }
+    ? { tier: 3, allowed: true, requiresApproval: true, readOnly: false, approvalScope, description }
     : { tier, allowed: true, requiresApproval: false, readOnly: false, description };
 }
 
@@ -1500,6 +1535,17 @@ export async function createActionIntent(
   if (input.correlationId !== undefined && isMcpOrigin && !UUID_RE.test(input.correlationId)) {
     throw new ActionIntentError('correlationId must be a UUID', 'invalid_correlation_id');
   }
+  // #9758: an MCP-origin OAuth intent must carry the auth_epoch its filing
+  // call was admitted at — release compares it to the live row. Without one
+  // the intent could never be released, so refuse before anything is written.
+  const isMcpOAuthOrigin = isMcpOrigin && originPrincipalKind === 'oauth_grant';
+  if (isMcpOAuthOrigin && !Number.isSafeInteger(input.originAuthEpoch)) {
+    throw new ActionIntentError(
+      'An OAuth-originated MCP intent requires the verified auth epoch',
+      'principal_not_supported',
+    );
+  }
+  const originAuthEpoch = isMcpOAuthOrigin ? (input.originAuthEpoch as number) : null;
   const replayIdentity = {
     source: input.source,
     originPrincipalKind,
@@ -1671,7 +1717,7 @@ export async function createActionIntent(
     };
   }
 
-  const { check: guardrail, context: guardrailContext } = externalTool
+  const { check: classified, context: guardrailContext } = externalTool
     ? {
         check: {
           tier: 3,
@@ -1712,6 +1758,22 @@ export async function createActionIntent(
         input.orgId ?? auth.orgId ?? null,
         input.guardrailContext,
       );
+  // #10027: an MCP filing of a NON-read action that a per-action table rates
+  // below Tier 3 on a registry-Tier-3 tool (edr_endpoint_action scan). The MCP
+  // gate runs only read-only below-Tier-3 actions directly and files every
+  // other one, so this is approved at the tool's registry Tier 3, the tier
+  // release revalidation compares against (`getToolTier > riskTier` fails it
+  // as tier_escalated). One supervised approver, like P2-1's agent Tier-2
+  // lane: the action's own classification is below Tier 3, and four_eyes
+  // would make a scan harder to approve than an isolate. A read-only call, a
+  // registry tier below 3, or any other source keeps the tier gate below.
+  const guardrail: GuardrailCheck = input.mcpRegistryTierApproval === true
+    && input.source === 'mcp_api'
+    && !externalTool && !invokedFlow && !builtinIntent
+    && classified.allowed
+    && needsRegistryTier3Approval(input.toolName, classified)
+    ? { ...classified, tier: 3, requiresApproval: true, readOnly: false, approvalScope: 'supervised' }
+    : classified;
   if (!guardrail.allowed || guardrail.tier >= 4) {
     throw new ActionIntentTierError(
       `Tool "${input.toolName}" is not permitted on the action-intent path: ${guardrail.reason ?? 'blocked'}`,
@@ -1764,6 +1826,11 @@ export async function createActionIntent(
       // W05 (#5220): a built-in intent is for exactly this step row's built-in at its pinned tier.
       || (builtinIntent && (
         facts.step.tool !== input.toolName || facts.step.toolSource !== 'builtin' || facts.step.tier !== guardrail.tier
+      ))
+      // #10288: likewise an external intent is for exactly this step row's
+      // tool-source tool, pinned Tier 3 (the binding's fixed verdict).
+      || (externalTool && (
+        facts.step.tool !== input.toolName || facts.step.toolSource !== 'tenant' || facts.step.tier !== 3
       ))
     ) {
       throw new ActionIntentError(
@@ -2188,13 +2255,21 @@ export async function createActionIntent(
     : runScriptGroupNote
       ? `${buildTargetSummary(input.toolName, input.input)} [${runScriptGroupNote}]`
       : buildTargetSummary(input.toolName, input.input);
-  const impactSummary = externalTool
+  const baseImpactSummary = externalTool
     ? `Calls ${input.toolName} on ${externalTool.sourceName} with arguments: ${
         Object.keys(input.input).length > 0 ? Object.keys(input.input).sort().join(', ') : '(none)'
       }`
     : invokedFlow
     ? `Starts flow "${invokedFlow.flowName}" with inputs: ${flowInputKeys()}. Its own sensitive steps still wait for approval.`
     : buildImpactSummary(input.toolName, input.input, guardrail);
+  // Approver scope on a partner-wide intent. The summary is the risk line on every
+  // approval surface, so it says who can approve whichever path filed this.
+  let requirePartnerAxis = false;
+  if (mayHavePartnerWideEffect(input.toolName, input.input)) {
+    const { intentRequiresPartnerAxisApprover } = await import('./partnerAxisApprover');
+    requirePartnerAxis = await intentRequiresPartnerAxisApprover({ actionName: input.toolName, arguments: input.input, orgId });
+  }
+  const impactSummary = requirePartnerAxis ? `${baseImpactSummary} ${PARTNER_LEVEL_APPROVER_NOTE}` : baseImpactSummary;
   // What the approver READS. `targetSummary` stays the audit signature.
   const labelReason = input.actionLabel ?? guardrail.description ?? null;
   // #5106 turned "on device 6eae0f70..." into "on <name>" using the SCOPED
@@ -2367,6 +2442,7 @@ export async function createActionIntent(
           ? FLOW_TOOL_APPROVER_PERMISSION
           : undefined,
     requireOrgWideGovernance,
+    ...(requirePartnerAxis ? { requirePartnerAxis } : {}),
     onDiagnostics: (diagnostics) => {
       governanceDiagnostics = diagnostics;
     },
@@ -2553,11 +2629,11 @@ export async function createActionIntent(
       // effect_digest NULL, which both release paths treat as "nothing to
       // check", not a failure. The `unresolved` cases are audited after
       // commit — they are intents that SHOULD have been pinned and weren't.
-      const effectDigestOutcome = await computeEffectDigestOutcome(input.toolName, input.input, db);
+      const effectDigestOutcome = await computeEffectDigestOutcome(input.toolName, input.input, db, { intentOrgId: orgId });
       // A tool whose pin is MANDATORY (effectDigest.ts's
       // requiresPinnedEffectDigest) never stores a NULL digest: refuse the
       // proposal instead of inheriting the legacy "nothing to check" fallback.
-      if (effectDigestOutcome.kind !== 'pinned' && requiresPinnedEffectDigest(input.toolName)) {
+      if (effectDigestOutcome.kind !== 'pinned' && requiresPinnedEffectDigest(input.toolName, input.input)) {
         throw new EffectDigestUnresolvableError(
           input.toolName,
           effectDigestOutcome.kind === 'unresolved' ? effectDigestOutcome.reason : 'no resolver',
@@ -2734,6 +2810,8 @@ export async function createActionIntent(
                   : flowPrincipal
                     ? flowPrincipal.flowId
                     : null,
+          // #9758: set only for an MCP-origin oauth_grant intent; immutable.
+          originAuthEpoch,
           // #5022 W01: persist the AI origin at INSERT (these columns are
           // never updated — `action_intents_immutable_trg` blocks it). The
           // release worker rebuilds the AuthContext from scratch, so without

@@ -32,9 +32,10 @@ const G_PAUSED = '33333333-3333-4333-8333-333333333333';
 const G_ORG = '44444444-4444-4444-8444-444444444444';
 const auth = { user: { id: 'u1' }, partnerId: PARTNER, scope: 'partner' };
 const future = new Date(Date.now() + 86_400_000);
+const CREATED = new Date('2027-01-22T10:00:00.000Z');
 const grant = (id: string, over: Record<string, unknown> = {}) => ({
   id, partnerId: PARTNER, orgId: null, grantorUserId: 'u1', status: 'active', pausedReason: null,
-  currentRevisionId: 'r1', expiresAt: future, budgetCentsPerDay: 100, floorTickMinutes: 60, ...over,
+  currentRevisionId: 'r1', expiresAt: future, budgetCentsPerDay: 100, floorTickMinutes: 60, createdAt: CREATED, ...over,
 });
 const thread = { id: 'th1', grantId: G_ACTIVE, partnerId: PARTNER };
 const base = { thread: { id: 'th1' }, focusOrgName: null, grant: { id: G_ACTIVE }, wideningAvailable: false };
@@ -63,7 +64,7 @@ describe('GET /wisp/home', () => {
     expect(await res.json()).toEqual({ data: { ...base, ...sections } });
     expect(h.listGrants).toHaveBeenCalledWith({ auth, view: 'mine' });
     expect(h.buildHomeSections).toHaveBeenCalledWith({
-      auth, partnerId: PARTNER, grantId: G_ACTIVE, grantorUserId: 'u1', threadId: 'th1', ceiling: { grantId: G_ACTIVE },
+      auth, partnerId: PARTNER, grantId: G_ACTIVE, grantorUserId: 'u1', threadId: 'th1', grantCreatedAt: CREATED, ceiling: { grantId: G_ACTIVE },
     });
   });
 
@@ -94,11 +95,19 @@ describe('GET /wisp/home', () => {
     expect(h.buildHomeSections).toHaveBeenCalledWith(expect.objectContaining({ grantId: G_PAUSED, ceiling: null }));
   });
 
-  it('no usable grant → 404 no_grant (the page shows the start card)', async () => {
+  it('no usable grant → 200 { data: null }, an expected state, not a 404 (#10200; the page shows the start card)', async () => {
     h.listGrants.mockResolvedValue([grant(G_ACTIVE, { status: 'revoked' })]);
     const res = await get('/home');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: null });
+    expect(h.buildHomeSections).not.toHaveBeenCalled();
+  });
+
+  it('an explicit grantId that is not the caller\'s usable grant stays the existence-neutral 404', async () => {
+    h.listGrants.mockResolvedValue([grant(G_ACTIVE, { status: 'revoked' })]);
+    const res = await get(`/home?grantId=${G_ACTIVE}`);
     expect(res.status).toBe(404);
-    expect(await res.json()).toMatchObject({ code: 'no_grant' });
+    expect(await res.json()).toMatchObject({ code: 'not_found' });
   });
 
   it('a corrupt ceiling pin is the thread route\'s 500, not a quiet empty home', async () => {

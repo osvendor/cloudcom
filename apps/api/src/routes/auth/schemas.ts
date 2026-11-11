@@ -1,6 +1,6 @@
 import { MIGRATION_WINDOW_MAX_ORGS } from '../../services/migrationWindowLimits';
 import { z } from 'zod';
-import { orgPaymentSettingsPatchSchema, partnerPaymentSettingsPatchSchema, newPartnerPurchaseSelectionSchema } from '@breeze/shared';
+import { isMfaRecoveryCode, orgPaymentSettingsPatchSchema, partnerPaymentSettingsPatchSchema, launchPurchaseSelectionSchema, signupIntentSchema } from '@breeze/shared';
 import { envFlag } from '../../utils/envFlag';
 import type { StepUpOperation } from '../../services/mfaStepUpGrant';
 import { MAINTENANCE_MAX_BULK_DEVICES, MAINTENANCE_MAX_DURATION_HOURS } from '../../services/maintenanceStepUpLimits';
@@ -39,7 +39,10 @@ export const registerSchema = z.object({
 
 export const registerPartnerSchema = z.object({
   companyName: z.string().min(2).max(255),
-  purchaseSelection: newPartnerPurchaseSelectionSchema,
+  // What the signup is for. `purchaseSelection` is the legacy launch tuple, accepted
+  // only so an old cached client does not break; it normalizes to the default intent.
+  signupIntent: signupIntentSchema.optional(),
+  purchaseSelection: launchPurchaseSelectionSchema.optional(),
   email: z.string().email(),
   password: z.string().min(8),
   name: z.string().min(1).max(255),
@@ -51,10 +54,9 @@ export const registerPartnerSchema = z.object({
 // TOTP/SMS codes are 6 digits; recovery codes are `XXXX-XXXX` (8 [A-Z0-9]
 // with a hyphen). Accept either shape here; the handler routes on `method`.
 const totpOrSmsCode = /^\d{6}$/;
-const recoveryCode = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 export const mfaVerifySchema = z.object({
   code: z.string().refine(
-    (v) => totpOrSmsCode.test(v.trim()) || recoveryCode.test(v.trim()),
+    (v) => totpOrSmsCode.test(v.trim()) || isMfaRecoveryCode(v),
     { message: 'Invalid code format' },
   ),
   tempToken: z.string().optional(),
@@ -164,6 +166,10 @@ const STEP_UP_OPERATIONS = [
   'add_factor',
   'rotate_recovery_codes',
   'delete_passkey',
+  // #10650: POST /auth/mfa/totp/remove. Provable by passkey or TOTP only —
+  // /mfa/step-up refuses SMS for it, and the recovery variant below stays
+  // limited to delete_passkey.
+  'remove_totp',
   'register_approver_device',
   'agent_rollback',
   'device_maintenance',
@@ -365,6 +371,13 @@ export const mfaStepUpSchema = z.discriminatedUnion('method', [
     operation: stepUpOperation,
     resource: stepUpResource.optional(),
     passkeyId: z.string().uuid().optional(),
+  }),
+  z.object({
+    method: z.literal('recovery'),
+    code: z.string().refine(isMfaRecoveryCode, { message: 'Invalid code' }),
+    operation: z.literal('delete_passkey'),
+    passkeyId: z.string().uuid(),
+    resource: z.never().optional(),
   }),
 ]);
 

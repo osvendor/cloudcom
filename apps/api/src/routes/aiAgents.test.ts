@@ -1,3 +1,8 @@
+vi.mock('../services/deviceGroupOwnership', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/deviceGroupOwnership')>(),
+  findPartnerOwnedGroupIds: vi.fn().mockResolvedValue([]),
+}));
+import { findPartnerOwnedGroupIds } from '../services/deviceGroupOwnership';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -32,6 +37,7 @@ import { AgentModelNotAllowedError } from '../services/aiAgents/agentModelErrors
 // below) — needed so a PATCH test can construct the exact instance
 // `updateAgentMock` rejects with.
 import { ModeNotAllowedForKindError } from '../services/aiAgents/agentService';
+import { TroubleshootAgentEditError } from '../services/aiAgents/troubleshootAgentEdit';
 
 const {
   selectMock,
@@ -519,7 +525,7 @@ function minimalToolCatalogDto(overrides: Partial<AgentToolCatalogDto> = {}): Ag
         ],
       },
     ],
-    presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [], research: [] },
+    presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [], research: [], troubleshoot: [] },
     unreachableTools: [],
     ...overrides,
   };
@@ -565,6 +571,7 @@ function trigger(app: Hono, body: unknown = { deviceId: DEVICE_ID }, id = AGENT_
 }
 
 beforeEach(() => {
+  vi.mocked(findPartnerOwnedGroupIds).mockReset().mockResolvedValue([]);
   vi.clearAllMocks();
   hasPermMock.mockReturnValue(true);
   loadMeasuredImpactMock.mockResolvedValue({ schemaVersion: 1, window: 30 });
@@ -1124,6 +1131,8 @@ const runDetailResponseSchema = z.object({
     deviceId: z.string().nullable(),
     deviceHostname: z.string().nullable(),
     alertId: z.string().nullable(),
+    // W2 #11085: the run card shows Continue only for a device_troubleshooting run.
+    profile: z.string(),
     wisp: z.object({
       grantId: z.string(),
       grantorUserId: z.string(),
@@ -1163,6 +1172,9 @@ const runDetailResponseSchema = z.object({
       actionName: z.string(),
       approvalScope: z.string(),
       decidedVia: z.string().nullable(),
+      // W2 #11085: the caller's own pending approval row (label + id) for inline approve.
+      actionLabel: z.string().nullable(),
+      approvalRequestId: z.string().nullable(),
     }).strict()),
     // Wave 6 PR 3 (#3828, Task 4); reshaped in P2-4 (#4191) onto the
     // `TicketTriageProposal` outcome (@breeze/shared) — no args/toolInput/
@@ -1719,6 +1731,30 @@ describe('GET /ai-agents/runs/:runId (execution-trace detail, #3828)', () => {
     expect(JSON.stringify(body)).not.toContain('"patchIds"');
   });
 
+
+  it('W2 #11085: a pending intent carries the caller\'s own approval row (id + label); others carry nulls; profile is on the DTO', async () => {
+    const PENDING = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const DONE = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    selectMock
+      .mockReturnValueOnce(selectChain([runRow({ sessionId: null, profile: 'device_troubleshooting' })]))
+      .mockReturnValueOnce(selectChain([
+        { id: PENDING, status: 'pending_approval', actionName: 'manage_services', approvalScope: 'supervised', decidedVia: null,
+          approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' },
+        // A duplicate join row for the same intent never doubles it.
+        { id: PENDING, status: 'pending_approval', actionName: 'manage_services', approvalScope: 'supervised', decidedVia: null,
+          approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' },
+        { id: DONE, status: 'completed', actionName: 'set_device_context', approvalScope: 'supervised', decidedVia: 'human',
+          approvalRequestId: null, actionLabel: null },
+      ]));
+    const res = await buildApp().request(`/ai-agents/runs/${RUN_ID}`);
+    expect(res.status).toBe(200);
+    const parsed = runDetailResponseSchema.parse(await res.json());
+    expect(parsed.data.profile).toBe('device_troubleshooting');
+    expect(parsed.data.intents).toEqual([
+      expect.objectContaining({ id: PENDING, approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' }),
+      expect.objectContaining({ id: DONE, approvalRequestId: null, actionLabel: null }),
+    ]);
+  });
 
   it('reads intents by requesting_agent_run_id and reports a COMPLETED sweep intent that run.intentIds dropped', async () => {
     // #4442 W05 — the exact regression act mode introduces. `run.intent_ids`
@@ -2513,7 +2549,7 @@ describe('GET /ai-agents/runs/:runId (execution-trace detail, #3828)', () => {
     expect(sqlParams(intentWhere)).toContain(RUN_ID);
     expect(parsed.data.intents).toEqual([{
       id: SWEEP_INTENT_ID, status: 'completed', actionName: 'manage_services:restart',
-      approvalScope: 'supervised', decidedVia: 'policy',
+      approvalScope: 'supervised', decidedVia: 'policy', actionLabel: null, approvalRequestId: null,
     }]);
     expect(parsed.data.artifacts).toEqual([]);
     expect(parsed.data.workspace).toBeNull();
@@ -4654,6 +4690,46 @@ describe('PATCH /ai-agents/:id — mode vs kind (Fleet Designer W01)', () => {
   });
 });
 
+describe('troubleshoot agent edit restrictions (#11084)', () => {
+  it('PATCH maps TroubleshootAgentEditError to 400 troubleshoot_agent_edit_restricted with fields', async () => {
+    updateAgentMock.mockRejectedValueOnce(new TroubleshootAgentEditError(['mode', 'toolAllowlist']));
+
+    const res = await buildApp().request(`/ai-agents/${AGENT_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'act' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      code: 'troubleshoot_agent_edit_restricted',
+      fields: ['mode', 'toolAllowlist'],
+    });
+  });
+
+  it('mapError maps it directly', () => {
+    const jsonMock = vi.fn((body: unknown, status: number) => ({ body, status }));
+    const ctx = { json: jsonMock } as unknown as Parameters<typeof mapError>[0];
+    mapError(ctx, new TroubleshootAgentEditError(['kind']));
+    expect(jsonMock).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'troubleshoot_agent_edit_restricted', fields: ['kind'] }),
+      400,
+    );
+  });
+
+  it('POST with kind troubleshoot is refused at the zod layer (400) and never reaches createAgent', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    vi.mocked(createAgent).mockClear();
+    const res = await buildApp().request('/ai-agents', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'T', kind: 'troubleshoot', mode: 'shadow' }),
+    });
+    expect(res.status).toBe(400);
+    expect(vi.mocked(createAgent)).not.toHaveBeenCalled();
+  });
+});
+
 // AI model registry W03 (Task 12 Step 7A): the policy model is bound to a
 // registry offering at write time; a refusal is an actionable 400 (503 while
 // the partner's registry cutover is pending).
@@ -5430,5 +5506,22 @@ describe('GET /ai-agents/runs/:runId/artifacts (execution-plane W01, reconciliat
     expect(Array.isArray(detailBody.data)).toBe(false);
     expect(detailBody.data).not.toHaveProperty('downloadPath');
     expect(listArtifactsForAuthMock).toHaveBeenCalledTimes(1);   // detail did not hit the list
+  });
+});
+
+describe('partner-owned AI agent run scope', () => {
+  it.each(['POST', 'PATCH'])('%s refuses partner group triggers with 400 before persisting', async (method) => {
+    const { createAgent, updateAgent } = await import('../services/aiAgents/agentService');
+    vi.mocked(findPartnerOwnedGroupIds).mockResolvedValueOnce([AGENT_ID]);
+    const res = await buildApp().request(method === 'POST' ? '/ai-agents' : `/ai-agents/${AGENT_ID}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...(method === 'POST' ? { kind: 'triage', name: 'Triage' } : {}), triggers: { deviceGroupIds: [AGENT_ID] } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'PARTNER_GROUP_TARGET_UNSUPPORTED', groupIds: [AGENT_ID] });
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(updateAgent).not.toHaveBeenCalled();
+    expect(findPartnerOwnedGroupIds).toHaveBeenCalledWith([AGENT_ID]);
   });
 });

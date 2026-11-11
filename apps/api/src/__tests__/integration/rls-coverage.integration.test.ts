@@ -137,9 +137,15 @@ const INTENTIONAL_UNSCOPED: ReadonlySet<string> = new Set<string>([
 // lifecycle filtering only, and tenant-wide revocation uses system DB context
 // after app-layer authorization.
 const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
+  // Event org for erasure/merge/export; read authority is the parent webhook's owner.
+  'webhook_deliveries',
   // migration_window_orgs (#8313): partner-axis (PARTNER_TENANT_TABLES); its
   // org_id names an org the window may import into, not the row's tenant.
   'migration_window_orgs',
+  // ticket_import_org_maps (#8313 W4): partner-axis (PARTNER_TENANT_TABLES);
+  // its org_id is the Breeze org a source org imports into, not the row's
+  // tenant.
+  'ticket_import_org_maps',
   'oauth_authorization_codes',
   'oauth_grants',
   'oauth_refresh_tokens',
@@ -373,6 +379,19 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   // migrationWindowsRls.integration.test.ts.
   ['migration_windows', 'partner_id'],
   ['migration_window_orgs', 'partner_id'],
+  // Ticket import framework (#8313 W4, 2027-01-20-100000): a connected
+  // source, its org and category maps, its runs, its ticket ledger and the run
+  // report's issue rows. Partner-axis, no org owner: an import spans orgs and
+  // is a partner-admin action. Policy: breeze_current_scope()='system' OR
+  // breeze_has_partner_access(partner_id). ticket_import_org_maps also carries
+  // a non-tenancy org_id and is in ORG_AXIS_POLICY_EXCLUDED_TABLES. Functional
+  // forge: ticketImportRls.integration.test.ts.
+  ['ticket_import_sources', 'partner_id'],
+  ['ticket_import_org_maps', 'partner_id'],
+  ['ticket_import_category_maps', 'partner_id'],
+  ['ticket_import_runs', 'partner_id'],
+  ['ticket_import_items', 'partner_id'],
+  ['ticket_import_run_issues', 'partner_id'],
   // Stripe payments (2026-06-15): one connected Stripe account per partner
   // (RLS shape 3, flat breeze_has_partner_access(partner_id)). The sibling
   // invoice_stripe_payments table carries a direct org_id column and is
@@ -564,6 +583,14 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
 // is the canonical case: a user row is visible if the caller has access
 // to the user's partner OR the user's org OR is the user themselves.
 const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  // webhooks_one_owner_chk, 2027-01-13-100000-webhooks-partner-ownership.sql:
+  // no partner-wide SELECT branch per OD1. Functional proof: webhooksPartnerRls.
+  'webhooks',
+  // #10521 W1: device_groups_one_owner_chk in 2027-01-12-200000; the
+  // device_groups_partner_wide_select branch ships in the same file and is
+  // load-bearing on the agent-auth config path. Functional proof:
+  // deviceGroupsPartnerRls.integration.test.ts.
+  'device_groups',
   'service_catalogs',
   'service_catalog_items',
   'billing_payment_settings',
@@ -654,6 +681,10 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // 2026-12-20-200100. Functional forge proof:
   // ticketApprovalSettingsPartnerRls.integration.test.ts.
   'ticket_approval_settings',
+  // portal_access_policies (W3 #11380): portal sign-in policy, org override XOR
+  // partner default; both partner-wide SELECT branches ship in its migration.
+  // Functional forge proof: portalAccessPoliciesPartnerRls.integration.test.ts.
+  'portal_access_policies',
   // tool_sources / tool_source_tools (Tool catalog W01, #5215 / #5216, spec
   // 2026-09-07 §5): a registration of an external MCP server is org-scoped
   // (org_id set) OR partner-wide (partner_id set, org_id NULL — one MSP
@@ -684,6 +715,13 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // verbatim plus the flow_versions_partner_wide_select branch. Functional
   // cross-partner forge proof: flowRunsPartnerRls.integration.test.ts.
   'flow_versions',
+  // Tool Catalog W06 (#5221, 2027-01-09-100000): the conversion ledger and the
+  // automation-wide occurrence claims copy the automations/flows shape — org_id
+  // XOR partner_id, the flows_isolation predicate verbatim plus the
+  // *_partner_wide_select branch; owner pair kept equal to the automation's by
+  // deferred owner-guard constraint triggers.
+  'flow_automation_conversions',
+  'automation_occurrence_claims',
   // Business-hours calendars (#8973 W4, 2027-01-03-160000): org_id XOR
   // partner_id config table plus three children that DENORMALISE the owner
   // pair from their parent (owner-guard constraint triggers, like
@@ -739,6 +777,11 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // digest, org-less concern), no breeze_current_partner_id() read branch.
   // Functional forge proof: wispThreadPostsRls.integration.test.ts.
   'wisp_thread_posts',
+  // Wisp check-in timers W01 (#10992): wisp_check_ins is the same shape —
+  // partner_id always set, org_id NULL for a check-in on a partner-level
+  // thread, no breeze_current_partner_id() read branch.
+  // Functional forge proof: wispCheckInsRls.integration.test.ts.
+  'wisp_check_ins',
   'deployment_invites',
   'access_reviews',
   // ai_agents (AI operator wave 1): an agent is org-scoped (org_id set) OR
@@ -1002,6 +1045,15 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // reportsPartnerRls.integration.test.ts. Deliberately NOT in
   // XOR_OWNERSHIP_DUAL_AXIS_TABLES — see the exclusion note there.
   'reports',
+  // #11412 W01 (origin #9246): software_upload_sessions mirrors the owner of
+  // the catalog row it uploads into — org_id XOR partner_id
+  // (software_upload_sessions_one_owner_chk, 2027-01-22-211500). Deliberately
+  // NOT in XOR_OWNERSHIP_DUAL_AXIS_TABLES: an in-flight partner upload is
+  // partner-private, so it carries no partner-wide SELECT branch (plan D3, the
+  // reports/webhooks precedent). The org_id column keeps org-tenant
+  // auto-discovery asserting the org branch; the partner branch, forge, XOR
+  // and cascade proof is softwareUploadSessionsPartnerRls.integration.test.ts.
+  'software_upload_sessions',
   // #4247: report_runs mirrors its parent — org_id XOR partner_id
   // (report_runs_one_owner_chk), pinned to the parent's owner by DEFERRABLE
   // composite FKs, one direct FOR ALL owner policy (no parent EXISTS join).
@@ -1029,7 +1081,17 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
 // read, so reports must never carry one. Its partner branch is proven
 // functionally by reportsPartnerRls.integration.test.ts instead. The same
 // holds for its runs, `report_runs` (#4247, reportRunsOwnerRls).
+//
+// `webhooks` (#10531) also has an XOR CHECK but carries partner-private
+// cross-org plumbing: URL, secret, headers and cross-org delivery history.
+// OD1 forbids org sessions reading partner webhooks; the SELECT branch would
+// violate that boundary. Functional proof: webhooksPartnerRls.integration.test.ts.
 const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
+  // #10521 W1: device_groups_one_owner_chk in 2027-01-12-200000; the
+  // device_groups_partner_wide_select branch ships in the same file and is
+  // load-bearing on the agent-auth config path. Functional proof:
+  // deviceGroupsPartnerRls.integration.test.ts.
+  'device_groups',
   'billing_payment_settings',
   'caller_verification_policies',
   // fix_memory_one_owner_chk, 2026-11-03-100000 (AI Suggested Fixes W1); its
@@ -1066,6 +1128,9 @@ const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
   // ticket_approval_settings_one_owner_chk, 2026-12-20-200100 (#4617). Its
   // partner-wide SELECT branch ships in the same migration.
   'ticket_approval_settings',
+  // portal_access_policies_one_owner_chk, 2027-01-22-231500 (W3 #11380). Its
+  // partner-wide SELECT branches ship in the same migration.
+  'portal_access_policies',
   // tool_sources_one_owner_chk / tool_source_tools_one_owner_chk
   // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-193500 (#5216).
   // Both partner-wide SELECT branches ship in that same migration, so neither
@@ -1079,6 +1144,11 @@ const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
   // partner-wide SELECT branch (flow_versions_partner_wide_select) ships in the
   // same file. Forge proof: flowRunsPartnerRls.integration.test.ts.
   'flow_versions',
+  // flow_automation_conversions_one_owner_chk / automation_occurrence_claims_one_owner_chk,
+  // 2027-01-09-100000-flow-automation-conversions.sql (#5221); both partner-wide
+  // SELECT branches ship in the same file.
+  'flow_automation_conversions',
+  'automation_occurrence_claims',
   // business_calendars_one_owner_chk and the three children's *_one_owner_chk
   // ((org_id IS NULL) <> (partner_id IS NULL)), 2027-01-03-160000 (#8973 W4).
   // All four partner-wide SELECT branches ship in the same file.

@@ -1,5 +1,41 @@
 # CloudCom upstream maintenance
 
+## Upstream v0.128.0 intake (2026-11-10)
+
+Candidate fork version is 0.128.5, based on exact upstream commit
+`a92212fcff9da71046d3e0feb3fbb3c6b31fd920`. This entry records integration,
+not production activation. Native promotion remains separate; the server
+baseline retains the existing 0.125.5 binary source until native acceptance.
+
+Upstream short alert transactions replace the old outer evaluation transaction.
+Keep the fork concurrency budget, tenant-scoped successor deduplication, bounded
+telemetry and conditional metric reads. Hierarchy preparation has its own short
+system context; each rule and detach path owns its context. Upstream capture now
+uses a DIB section on a dedicated locked desktop-following thread, superseding
+our separate GetDIBits fallback files. PAM local consent protocol and managed
+RustDesk reconciliation remain fork requirements. Native Windows acceptance is
+still required before promotion.
+
+The device launcher composes upstream explicit-provider selection with enrolled
+RustDesk identity and managed staff admission. Customer remote-only capabilities
+and native session restrictions compose with upstream portal browser-access and
+session-method policy; contact invitations retain their remote-only mode.
+Mailbox explicit eligibility floors remain authoritative, while legacy null
+floors retain original creation time so outages cannot silently skip mail.
+
+There are 108 new upstream SQL migrations and no changed existing SQL migration
+files. Rehearse against a restored database and repeat for idempotence. The
+portal status/auth-method backfill requires principal checks. UniFi changes its
+unique conflict key: code-only rollback is unsafe after migration; restore the
+quiesced database together with previous code/configuration. API and workers
+must cut over together because webhook retry state moves to PostgreSQL.
+
+CloudCom workflows remain authoritative; upstream workflows are not re-enabled.
+The dependency lock was regenerated to reconcile Hono peer versions, followed
+by focused auth, remote-access, alert and mailbox checks. Production deployment,
+restore proof and signed inventory evidence are tracked outside this source file.
+
+
 ## Alert evaluation and metric aggregation cost (2026-10-27)
 
 Scheduled alert evaluation loads one fresh `DeviceHierarchy` inside its existing
@@ -1125,3 +1161,26 @@ Rollback requires a verified database restore as well as prior images and runtim
 configuration. A source checkpoint and a restore rehearsal precede live changes.
 This entry does not certify deployment or completion; exact validation and
 promotion receipts are recorded by the control plane.
+
+## v0.128 remote-tool menu integration
+
+The upstream #10922 Connect Desktop split menu supersedes the separate
+`RemoteAccessAlternatives` button on `RemoteToolsPage`. Device-provided tools
+and the default now flow through `remoteAccessProviders` and
+`remoteAccessDefaultProviderId`; explicit choices are re-authorized by the
+launch API. The existing CloudCom alternatives API/component remain available
+for other consumers and are still protected by the customization inventory.
+
+CloudCom behavior retained: browser desktop is the built-in default;
+`preferBuiltIn` and `autoStart` are preserved; RustDesk picks (including menu
+picks) require the same managed staff launch admission and exact device-bound
+`cloudcom-remote://staff/connect/…` URI. A denied or unavailable managed
+admission does not fall back to a password-bearing RustDesk launch or WebRTC.
+When `preferBuiltIn` is set, the primary label reflects the browser viewer and
+the otherwise-default provider remains available in the menu.
+
+Validation on GIT: the 11 ConnectDesktopButton/RemoteToolsPage test files
+covered 103 tests. Ten files passed initially; the split suite required its
+legacy native-viewer assertion to select `viewerMode="native"` explicitly.
+Its focused rerun passed all 23 tests. Added regressions cover explicit managed
+menu success, 403/503 refusal, and the `preferBuiltIn` menu/label combination.

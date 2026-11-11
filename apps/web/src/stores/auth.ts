@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { launchPurchaseSelectionSchema, type LaunchPurchaseSelection } from '@breeze/shared';
+import { signupIntentSchema, type SignupIntent } from '@breeze/shared';
 import { persist } from 'zustand/middleware';
 import {
   startAuthentication,
@@ -17,8 +17,11 @@ import { resetPartnerCurrencyCache } from '@/lib/partnerCurrencyCache';
 import { resetEntitlementsCache } from '@/lib/entitlementsCache';
 import { resetApproximateTotalCache } from '@/lib/approximateTotalCache';
 import { clearSsoReauthGrant } from '@/lib/ssoReauthGrant';
+import { clearRememberedEnrollmentArtifacts } from '@/lib/rememberedEnrollmentArtifacts';
+import { totpEnrolledAfterPrimaryChange } from '@/lib/mfaFactorState';
 import { getSafeNext, loginPathWithNext } from '@/lib/authNext';
 import { isGlobalScopeRoute } from '@/lib/routeScope';
+import { throttleRetryDelayMs } from '@/lib/throttleRetry';
 import {
   parseMfaChallengeResponse,
   type MfaChallenge,
@@ -98,6 +101,13 @@ export interface User {
   // UNKNOWN, never as "has a password" — always compare with `=== false`, never
   // `!user?.hasPassword`.
   hasPassword?: boolean;
+  // #10650: whether an authenticator app (TOTP) is enrolled — as the primary
+  // (`mfaMethod: 'totp'`) or as the BACKUP beside a primary passkey
+  // (`mfaMethod: 'passkey'`). `mfaMethod` alone cannot say which, because it
+  // only names the primary. Populated by `GET /users/me`; absent on sessions
+  // persisted before the field. Compare with `=== true`: absent means unknown,
+  // and the UI must not offer an authenticator proof it cannot vouch for.
+  totpEnrolled?: boolean;
   preferences?: UserPreferences;
 }
 
@@ -105,6 +115,10 @@ export interface Tokens {
   accessToken: string;
   expiresInSeconds: number;
 }
+
+export type MfaAccountState =
+  | { mfaEnabled: true; mfaMethod: MfaPrimaryMethod }
+  | { mfaEnabled: false; mfaMethod: null };
 
 /**
  * Why the app bounced the user to /login. Rendered as `?reason=<code>` by
@@ -148,6 +162,7 @@ interface AuthState {
   updateUser: (user: Partial<User>) => void;
   commitMfaEnrollmentIfCurrent: (generation: number, method: MfaPrimaryMethod, tokens?: Tokens) => boolean;
   commitMfaDisableIfCurrent: (generation: number, tokens?: Tokens) => boolean;
+  commitMfaStateIfCurrent: (generation: number, mfa: MfaAccountState, tokens?: Tokens) => boolean;
   commitReissuedSessionIfCurrent: (generation: number, tokens: Tokens) => boolean;
   setAuthThrottledUntil: (until: number | null) => void;
 }
@@ -231,6 +246,9 @@ export const useAuthStore = create<AuthState>()(
         // #8862: the profile page's stashed SSO re-auth grant is bound to this
         // session; never let the next sign-in on this tab restore it.
         clearSsoReauthGrant();
+        // #10923: the Add Device modal's remembered tokens and links are live
+        // enrollment credentials, and sign-out does not unload this tab.
+        clearRememberedEnrollmentArtifacts();
         // An evicted session must never come back via a stray throttle-recovery
         // reload — the redirect to /login owns navigation from here.
         cancelThrottleReload();
@@ -285,9 +303,14 @@ export const useAuthStore = create<AuthState>()(
             || !state.user
           ) return state;
           committed = true;
+          const next = { mfaEnabled: true, mfaMethod: method } as const;
           return {
             ...(tokens ? { tokens } : {}),
-            user: { ...state.user, mfaEnabled: true, mfaMethod: method },
+            user: {
+              ...state.user,
+              ...next,
+              totpEnrolled: totpEnrolledAfterPrimaryChange(next, state.user.totpEnrolled),
+            },
           };
         });
         return committed;
@@ -304,7 +327,28 @@ export const useAuthStore = create<AuthState>()(
           committed = true;
           return {
             ...(tokens ? { tokens } : {}),
-            user: { ...state.user, mfaEnabled: false, mfaMethod: null },
+            user: { ...state.user, mfaEnabled: false, mfaMethod: null, totpEnrolled: false },
+          };
+        });
+        return committed;
+      },
+
+      commitMfaStateIfCurrent: (generation, mfa, tokens) => {
+        let committed = false;
+        set((state) => {
+          if (
+            state.sessionGeneration !== generation
+            || !state.isAuthenticated
+            || !state.user
+          ) return state;
+          committed = true;
+          return {
+            ...(tokens ? { tokens } : {}),
+            user: {
+              ...state.user,
+              ...mfa,
+              totpEnrolled: totpEnrolledAfterPrimaryChange(mfa, state.user.totpEnrolled),
+            },
           };
         });
         return committed;
@@ -1614,6 +1658,52 @@ export async function fetchWithAuth(rawUrl: string, options: FetchWithAuthOption
     }
   }
 
+  // 429 on a READ: the condition clears on its own, so wait out the advertised
+  // window (bounded + jittered) and retry once instead of handing the caller a
+  // failure (#11195). Safe methods only — a mutation is never replayed. A
+  // second 429, a missing/oversized wait, or an aborted signal falls through to
+  // the caller, whose error UI reads a 429 as "Please wait".
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (response.status === 429 && (method === 'GET' || method === 'HEAD') && !signal.aborted) {
+    const waitMs = await throttleRetryDelayMs(response);
+    if (waitMs !== null && !signal.aborted) {
+      const stillLive = await new Promise<boolean>((resolve) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve(false);
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(true);
+        }, waitMs);
+        signal.addEventListener('abort', onAbort, { once: true });
+        // Aborted during the body read above: the event already fired.
+        if (signal.aborted) onAbort();
+      });
+      if (stillLive) {
+        // The first fetch's timeout timer is spent; give the retry its own so a
+        // stalled connection cannot hang it, and pick up any token refreshed
+        // while we waited.
+        const retryTimeout = new AbortController();
+        const retryTimer = setTimeout(
+          () => retryTimeout.abort(new DOMException(`Request timed out after ${Math.round(timeoutMs / 1000)}s`, 'TimeoutError')),
+          timeoutMs,
+        );
+        const retrySignal = externalSignal
+          ? AbortSignal.any([externalSignal, retryTimeout.signal])
+          : retryTimeout.signal;
+        const freshToken = useAuthStore.getState().tokens?.accessToken;
+        if (freshToken) headers.set('Authorization', `Bearer ${freshToken}`);
+        void response.body?.cancel().catch(() => {});
+        try {
+          response = await fetch(buildApiUrl(url), { ...init, headers, credentials: 'include', signal: retrySignal });
+        } finally {
+          clearTimeout(retryTimer);
+        }
+      }
+    }
+  }
+
   return response;
 }
 
@@ -1891,7 +1981,7 @@ export async function apiRegisterPartner(
   email: string,
   password: string,
   name: string,
-  purchaseSelection?: LaunchPurchaseSelection
+  signupIntent?: SignupIntent
 ): Promise<
   | { success: true; message: string }
   | { success: false; error: string; action?: { url: string; label: string } }
@@ -1901,7 +1991,7 @@ export async function apiRegisterPartner(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ companyName, email, password, name, acceptTerms: true, ...(purchaseSelection ? { purchaseSelection } : {}) })
+      body: JSON.stringify({ companyName, email, password, name, acceptTerms: true, ...(signupIntent ? { signupIntent } : {}) })
     });
 
     const data = await response.json();
@@ -2060,7 +2150,41 @@ export async function apiPrepareCfTerminalLogout(
   return outcome;
 }
 
+/**
+ * Session generation that `ensureSessionPermissions` last asked /users/me for.
+ * Keyed on `sessionGeneration`, so every login / logout / user switch re-arms it
+ * without a logout hook, and a failed read is not retried in a loop.
+ */
+let permissionsSelfHealGeneration: number | null = null;
+
+/**
+ * #9927 / #9586: the sidebar gates every permission-gated item on
+ * `user.permissions` and treats `undefined` as hidden. Some sessions reach the
+ * dashboard with a user object that never carried the field — the signup
+ * auto-login (`/auth/verify-email` returns a bare user), the forced-MFA
+ * hand-off, or a `breeze-auth` blob persisted before /users/me resolved — and
+ * nothing re-read /users/me until the next login-page sign-in.
+ *
+ * Called from the dashboard shell (AuthOverlay). Once the session has an access
+ * token and its user still has no permission list, pull /users/me once for this
+ * session generation. Missing permissions stay "hidden" until the server
+ * answers (a failed read leaves the nav closed); the API still enforces every
+ * permission server-side, so this only fixes what the nav shows.
+ */
+export function ensureSessionPermissions(): Promise<void> {
+  const { user, isAuthenticated, tokens, sessionGeneration } = useAuthStore.getState();
+  if (!isAuthenticated || !user || !tokens?.accessToken) return Promise.resolve();
+  if (Array.isArray(user.permissions)) return Promise.resolve();
+  if (permissionsSelfHealGeneration === sessionGeneration) return Promise.resolve();
+  permissionsSelfHealGeneration = sessionGeneration;
+  return fetchAndApplyPreferences();
+}
+
 export async function fetchAndApplyPreferences(): Promise<void> {
+  // Fence on the session: a same-document sign-out followed by another
+  // account's sign-in must never receive the previous account's /users/me
+  // (permissions, platform-admin flag, preferences, locale).
+  const generation = useAuthStore.getState().sessionGeneration;
   try {
     const response = await fetchWithAuth('/users/me');
     if (!response.ok) {
@@ -2071,6 +2195,17 @@ export async function fetchAndApplyPreferences(): Promise<void> {
     }
 
     const data = await response.json();
+    if (useAuthStore.getState().sessionGeneration !== generation) {
+      console.warn('[fetchAndApplyPreferences] session changed while /users/me was in flight; response dropped');
+      return;
+    }
+    // A refresh cookie for a different account than the persisted user (another
+    // tab signed in elsewhere) must not graft that account's grants onto it.
+    const storedUserId = useAuthStore.getState().user?.id;
+    if (typeof data.id === 'string' && storedUserId && data.id !== storedUserId) {
+      console.warn('[fetchAndApplyPreferences] /users/me answered for a different user; response dropped');
+      return;
+    }
     // isPlatformAdmin rides along with this refresh: fresh logins carry it in
     // the login payload, but sessions persisted before the field existed only
     // learn it here — without the merge, the platform-admin nav stays hidden
@@ -2082,6 +2217,10 @@ export async function fetchAndApplyPreferences(): Promise<void> {
     // the field existed still pick up their grants without a re-login.
     if (Array.isArray(data.permissions)) {
       useAuthStore.getState().updateUser({ permissions: data.permissions });
+    } else if (!Array.isArray(useAuthStore.getState().user?.permissions)) {
+      // The nav keeps every permission-gated item hidden in this state (#9927);
+      // make that diagnosable instead of a silently empty sidebar.
+      console.warn('[fetchAndApplyPreferences] GET /users/me returned no permissions list; gated navigation stays hidden');
     }
     // #4018: same rationale — the password-login path stores `data.user` from
     // /auth/login, which carries no hasPassword, and sessions persisted before
@@ -2093,6 +2232,11 @@ export async function fetchAndApplyPreferences(): Promise<void> {
     }
     if (typeof data.canManagePartnerWide === 'boolean') {
       useAuthStore.getState().updateUser({ canManagePartnerWide: data.canManagePartnerWide });
+    }
+    // #10650: same rationale as hasPassword — /auth/login's `user` carries no
+    // factor detail, so this refresh is what makes the field real.
+    if (typeof data.totpEnrolled === 'boolean') {
+      useAuthStore.getState().updateUser({ totpEnrolled: data.totpEnrolled });
     }
     if (data.preferences) {
       useAuthStore.getState().updateUser({ preferences: data.preferences });
@@ -2172,7 +2316,7 @@ export async function apiVerifyEmail(token: string): Promise<{
   user?: User;
   tokens?: Tokens;
   status?: 'sign_in';
-  purchaseSelection?: LaunchPurchaseSelection;
+  signupIntent?: SignupIntent;
   redirectUrl?: string;
 }> {
   try {
@@ -2191,8 +2335,8 @@ export async function apiVerifyEmail(token: string): Promise<{
     // Registration-completion path bounced to sign-in (address already taken).
     // 200 body but `verified: false` — surface the status, not success.
     if (data.verified === false && data.status === 'sign_in') {
-      const selected = launchPurchaseSelectionSchema.safeParse(data.purchaseSelection);
-      return { success: false, error: 'already_registered', status: 'sign_in', ...(selected.success ? { purchaseSelection: selected.data } : {}) };
+      const selected = signupIntentSchema.safeParse(data.signupIntent);
+      return { success: false, error: 'already_registered', status: 'sign_in', ...(selected.success ? { signupIntent: selected.data } : {}) };
     }
 
     return {

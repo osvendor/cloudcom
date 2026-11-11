@@ -55,6 +55,19 @@ describe('WispConcernsPanel', () => {
     expect(b!.textContent).toContain('digest only');
   });
 
+  it('hides the "quiet until" line once the concern is resolved or dismissed', async () => {
+    const recipient = { snoozedUntil: new Date(Date.now() + 3600_000).toISOString(), digestOnly: false };
+    await mountWith([
+      concern('r', 'high', { status: 'resolved', recipient }),
+      concern('d', 'medium', { status: 'dismissed', recipient }),
+      concern('s', 'low', { status: 'snoozed', recipient }),
+    ]);
+    const rows = Object.fromEntries(screen.getAllByTestId('wisp-concern-row').map((r) => [r.getAttribute('data-concern-id'), r]));
+    expect(rows.r!.textContent).not.toContain('quiet until');
+    expect(rows.d!.textContent).not.toContain('quiet until');
+    expect(rows.s!.textContent).toContain('quiet until');
+  });
+
   it('#concern=<id> expands that row', async () => {
     window.location.hash = '#concern=b';
     await mountWith([concern('a', 'high'), concern('b', 'low')]);
@@ -154,6 +167,17 @@ describe('WispConcernsPanel', () => {
     fireEvent.click(screen.getByTestId('wisp-concerns-filter'));
     await waitFor(() =>
       expect(api.listWispConcerns).toHaveBeenLastCalledWith('g1', ['open', 'snoozed', 'resolved', 'dismissed']));
+  });
+
+  it('#10104: a refreshKey change reloads, clearing a failed load (paused grant resumed)', async () => {
+    api.listWispConcerns.mockRejectedValueOnce(new Error('409 grant_inactive'));
+    const { rerender } = render(<WispConcernsPanel grantId="g1" threadId="t1" refreshKey={0} />);
+    await screen.findByTestId('wisp-concerns-load-error');
+    api.listWispConcerns.mockResolvedValue([concern('a', 'high')]);
+    rerender(<WispConcernsPanel grantId="g1" threadId="t1" refreshKey={1} />);
+    await screen.findAllByTestId('wisp-concern-row');
+    expect(screen.queryByTestId('wisp-concerns-load-error')).toBeNull();
+    expect(api.listWispConcerns).toHaveBeenCalledTimes(2);
   });
 
   it('renders the empty state', async () => {

@@ -1,3 +1,4 @@
+import type { AiPageContext } from '@breeze/shared';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // W19 (#10065): buildSystemPrompt pre-expands a page's tool domains under
@@ -16,11 +17,11 @@ vi.mock('../db/schema', () => ({
 vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
 
 const composeStaticSystemPrompt = vi.fn((_names: readonly string[], mode: string) => `STATIC:${mode}`);
-const renderPageContextToolBlocks = vi.fn((page: string, _names: readonly string[]) => `BLOCKS:${page}`);
+const renderPageContextToolBlocks = vi.fn((page: AiPageContext, _names: readonly string[]) => `BLOCKS:${page.type}`);
 const resolveToolIndexMode = vi.fn(() => 'lazy');
 vi.mock('./aiToolIndex', () => ({
   composeStaticSystemPrompt: (names: readonly string[], mode: string) => composeStaticSystemPrompt(names, mode),
-  renderPageContextToolBlocks: (page: string, names: readonly string[]) => renderPageContextToolBlocks(page, names),
+  renderPageContextToolBlocks: (page: AiPageContext, names: readonly string[]) => renderPageContextToolBlocks(page, names),
   resolveToolIndexMode: () => resolveToolIndexMode(),
 }));
 vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => ['query_devices', 'run_script'] }));
@@ -34,6 +35,7 @@ vi.mock('./aiModels/sessionModel', () => ({
 }));
 
 import { buildSystemPrompt } from './aiAgent';
+import type { GrantCeiling } from './wisp/grantAuthority';
 
 const auth: any = {
   user: { id: 'user-1', name: 'Tess Tech' },
@@ -66,7 +68,7 @@ describe('buildSystemPrompt page-context tool blocks (W19)', () => {
     ['alert', { type: 'alert', id: 'alert-1', title: 'Disk full' }],
   ] as const)('appends the %s page\'s blocks at the end of the page-context section', async (page, ctx) => {
     const prompt = await buildSystemPrompt(auth, ctx as never);
-    expect(renderPageContextToolBlocks).toHaveBeenCalledWith(page, ['query_devices', 'run_script']);
+    expect(renderPageContextToolBlocks).toHaveBeenCalledWith(ctx, ['query_devices', 'run_script']);
     const section = prompt.slice(prompt.indexOf('## Current Page Context'));
     expect(section).toContain(`\nBLOCKS:${page}`);
     expect(prompt.indexOf(`BLOCKS:${page}`)).toBeGreaterThan(prompt.indexOf('## Current Page Context'));
@@ -82,6 +84,15 @@ describe('buildSystemPrompt page-context tool blocks (W19)', () => {
     const prompt = await buildSystemPrompt(auth, { type: 'dashboard' } as never);
     expect(prompt).toContain('The user is on the main dashboard.');
     expect(prompt.endsWith('The user is on the main dashboard.')).toBe(true);
+  });
+
+  // #10430: a Wisp session's prompt names only tools its grant ceiling admits.
+  it('builds a Wisp session\'s index and page blocks from the tools its ceiling admits', async () => {
+    const ceiling = { deniedTools: new Set(['run_script']), toolAllowlist: null } as unknown as GrantCeiling;
+    const page = { type: 'device', id: '44444444-4444-4444-4444-444444444444', hostname: 'web-01' } as const;
+    await buildSystemPrompt(auth, page as never, undefined, ceiling);
+    expect(composeStaticSystemPrompt).toHaveBeenCalledWith(['query_devices'], 'lazy');
+    expect(renderPageContextToolBlocks).toHaveBeenCalledWith(page, ['query_devices']);
   });
 
   it('AI_TOOL_INDEX=full: legacy static prefix and no page blocks', async () => {

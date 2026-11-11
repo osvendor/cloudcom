@@ -219,8 +219,11 @@ jobs:
           Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -Repository PSGallery
           Import-Module Pester -RequiredVersion 5.7.1
           Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1 -Output Detailed -CI
+      - name: Validate reviewed cumulative fork feature groups
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true' || needs.delta.outputs.infra == 'true'
+        run: node scripts/cloudcom/validate-reviewed-fork.mjs
       - name: Verify the CloudCom delta classifier
-        run: node --test .github/scripts/cloudcom-delta.test.mjs
+        run: node --test .github/scripts/cloudcom-delta.test.mjs scripts/cloudcom/validate-reviewed-fork.test.mjs
 
   native:
     name: Native agent delta validation

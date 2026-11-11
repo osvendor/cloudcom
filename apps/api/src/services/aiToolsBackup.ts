@@ -6,11 +6,11 @@
  * Each tool wraps existing DB schema with org-scoped isolation.
  */
 
-import { db, runOutsideDbContext, withDbAccessContext } from '../db';
+import { db, runOutsideDbContext, withDbAccessContext, withDbTransactionIfHeld } from '../db';
+import { safeErrorMessage } from './aiModels/safeDbError';
 import {
   backupConfigs,
   backupJobs,
-  backupSnapshotFiles,
   backupSnapshots,
   configPolicyFeatureLinks,
   configurationPolicies,
@@ -32,11 +32,17 @@ import { deviceScopeCondition, deviceSiteDenied, resolveSiteAllowedDeviceIds } f
 import { loadSnapshotWithSiteAccess } from './aiToolsBackupShared';
 import { authorizeAiRestore } from './aiToolsRestoreAuthorization';
 import { backupJobHistoryOrderBy, latestBackupRunOrderBy } from './backupJobOrdering';
-import { resolveSelectedSnapshotPaths, selectedSnapshotPathError } from './backupSelectedPaths';
+import { selectedSnapshotPathError } from './backupSelectedPaths';
+import { resolveSelectedSnapshotPathsInDb } from './backupSnapshotBrowse';
 import { inArray } from 'drizzle-orm';
 import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 import { restoreIntegrityRefusalForActor } from './backupRestoreActorGate';
 import { sumStoredSnapshotBytes } from './backupStoredBytes';
+import {
+  getProviderCoverageForDevices,
+  listBackupHealthRows,
+  summarizeBackupHealth,
+} from './backupHealthReadModel';
 
 type BackupHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -50,6 +56,51 @@ function getOrgId(auth: AuthContext): string | null {
 
 function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
   return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/** Critical vendor rows listed in get_backup_status's org summary. */
+const VENDOR_ATTENTION_LIMIT = 10;
+
+const VENDOR_NOT_READ_NOTE = 'Vendor backups were not read: this caller has no accessible organizations.';
+const VENDOR_READ_FAILED_NOTE = 'Vendor backups could not be read (error). Do not conclude there are none.';
+
+/**
+ * Third-party (vendor) backup health for get_backup_status's org summary,
+ * from the unified backup read model's provider leg — the same rows Wisp
+ * readiness counts when it says backups are watchable (#10404). Returns null
+ * when the caller has no accessible org list (system scope, or none), so the
+ * tool says it did not read vendors instead of implying there are none.
+ */
+async function vendorBackupSummary(auth: AuthContext) {
+  const orgIds = auth.orgId ? [auth.orgId] : auth.accessibleOrgIds;
+  if (!orgIds || orgIds.length === 0) return null;
+  const scope = { orgIds };
+  const summary = await summarizeBackupHealth(scope, { sources: ['provider'] });
+  // Critical rows straight from the read model's health filter (it walks past
+  // healthy rows in batches), one read across every org in scope.
+  const attention = await listBackupHealthRows(scope, {
+    sources: ['provider'],
+    filter: { health: ['critical'] },
+    page: { limit: VENDOR_ATTENTION_LIMIT },
+  });
+  return {
+    endpoints: summary.endpoints,
+    // Unlinked vendor devices and M365 accounts are counted here, not in
+    // `endpoints`; an org protected only by those must not read as zero.
+    providerOnly: summary.providerOnly,
+    m365Accounts: summary.m365Accounts,
+    byHealth: summary.byHealth,
+    byStatus: summary.byStatus,
+    byRecency: summary.byRecency,
+    needsAttention: attention.rows.map((r) => ({
+      orgName: r.orgName,
+      name: r.name,
+      status: r.status,
+      lastSuccessAt: r.lastSuccessAt,
+      errorsCount: r.errorsCount,
+    })),
+    needsAttentionTruncated: attention.nextCursor !== null,
+  };
 }
 
 /** Wrap handler in try-catch so DB/runtime errors return JSON instead of crashing */
@@ -85,10 +136,10 @@ async function markRestoreJobFailed(restoreJobId: string, error: string): Promis
       completedAt: new Date(),
       updatedAt: new Date(),
       targetConfig: sql`coalesce(${restoreJobs.targetConfig}, '{}'::jsonb) || jsonb_build_object(
-        'error', ${error},
+        'error', ${error}::text,
         'result', jsonb_build_object(
           'status', 'failed',
-          'error', ${error}
+          'error', ${error}::text
         )
       )`,
     })
@@ -308,7 +359,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'get_backup_status',
-      description: 'Get backup health summary for a device or the entire organization.',
+      description: 'Get backup health summary for a device or the entire organization, covering Breeze backups and synced third-party backup vendors.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -341,7 +392,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
         const dc = orgWhere(auth, devices.orgId);
         if (dc) deviceConditions.push(dc);
-        const [device] = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices)
+        const [device] = await db.select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId }).from(devices)
           .where(and(...deviceConditions)).limit(1);
         if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
@@ -384,12 +435,27 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           and(eq(backupSnapshots.deviceId, deviceId), ...(snapOrgCond ? [snapOrgCond] : [])),
         );
 
+        // Third-party backup coverage for this device (#10404). The device
+        // passed the org and site checks above, so its own org is the scope.
+        // A vendor read failure must not discard the Breeze job data above.
+        let vendorBackup: { covered: boolean; health: string } | null = null;
+        let vendorBackupNote: string | undefined;
+        try {
+          vendorBackup = (await getProviderCoverageForDevices(device.orgId, [deviceId])).get(deviceId) ?? null;
+        } catch (err) {
+          console.error('[backup:get_backup_status] vendor coverage read failed', { deviceId }, err);
+          vendorBackupNote = VENDOR_READ_FAILED_NOTE;
+        }
+
         return JSON.stringify({
           deviceId,
           latestJob: latestJob ?? null,
           lastSuccessfulBackup: lastSuccess?.completedAt ?? null,
           snapshotCount: snapshotStats.count,
           totalBackupSize: snapshotStats.totalBytes,
+          // null = no vendor backup linked to this device.
+          vendorBackup,
+          ...(vendorBackupNote ? { vendorBackupNote } : {}),
         });
       }
 
@@ -432,6 +498,17 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         snapshotConditions.length > 0 ? and(...snapshotConditions) : undefined,
       );
 
+      // A vendor read failure must not discard the Breeze-native data above.
+      let vendorBackups: Awaited<ReturnType<typeof vendorBackupSummary>> = null;
+      let vendorBackupsNote: string | undefined;
+      try {
+        vendorBackups = await vendorBackupSummary(auth);
+        if (!vendorBackups) vendorBackupsNote = VENDOR_NOT_READ_NOTE;
+      } catch (err) {
+        console.error('[backup:get_backup_status] vendor backup summary failed', { orgId: auth.orgId }, err);
+        vendorBackupsNote = VENDOR_READ_FAILED_NOTE;
+      }
+
       return JSON.stringify({
         configs: {
           total: configStats?.total ?? 0,
@@ -442,6 +519,9 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           snapshotCount: storageStats.count,
           totalBytes: storageStats.totalBytes,
         },
+        // Third-party backup vendors (e.g. Cove) synced into Breeze (#10404).
+        vendorBackups,
+        ...(vendorBackupsNote ? { vendorBackupsNote } : {}),
       });
     }),
   });
@@ -689,21 +769,13 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
 
       let resolvedSelectedPaths: string[] = [];
       if (restoreType === 'selective') {
-        const snapshotFiles = await db
-          .select({ sourcePath: backupSnapshotFiles.sourcePath })
-          .from(backupSnapshotFiles)
-          .where(eq(backupSnapshotFiles.snapshotDbId, snapshot.id));
-
-        if (snapshotFiles.length === 0) {
+        // Map each selection (possibly in the browse tree's forward-slash
+        // form) back to the stored original the agent matches against, and
+        // each folder to its stored-form prefix (#11026).
+        const resolution = await resolveSelectedSnapshotPathsInDb(snapshot.id, selectedPaths ?? []);
+        if (!resolution.ok && resolution.reason === 'no_readable_index') {
           return JSON.stringify({ error: 'Selective restore is unavailable for snapshots without indexed files' });
         }
-
-        // Map each selection (possibly in the browse tree's forward-slash
-        // form) back to the stored original the agent matches against.
-        const resolution = resolveSelectedSnapshotPaths(
-          selectedPaths ?? [],
-          snapshotFiles.map((row) => row.sourcePath)
-        );
         if (!resolution.ok) {
           return JSON.stringify({ error: selectedSnapshotPathError(resolution) });
         }
@@ -763,44 +835,47 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       if (!restoreJob) return JSON.stringify({ error: 'Failed to create restore job' });
 
       try {
-        const { command, error } = await aiQueueCommandForExecution(
-          auth,
-          'restore_snapshot',
-          restoreJob.deviceId,
-          CommandTypes.BACKUP_RESTORE,
-          {
-            restoreJobId: restoreJob.id,
-            snapshotId: snapshot.providerSnapshotId,
-            targetPath: restoreJob.targetPath ?? '',
-            selectedPaths: resolvedSelectedPaths,
-            // A reference only: resolved when the command is delivered.
-            ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
-          },
-          { userId: auth.user?.id ?? undefined }
-        );
+        // One savepoint: the catch below marks the job failed on this same
+        // transaction, and a failed link must not leave a queued command (#11225).
+        const dispatched = await withDbTransactionIfHeld(async () => {
+          const { command, error } = await aiQueueCommandForExecution(
+            auth,
+            'restore_snapshot',
+            restoreJob.deviceId,
+            CommandTypes.BACKUP_RESTORE,
+            {
+              restoreJobId: restoreJob.id,
+              snapshotId: snapshot.providerSnapshotId,
+              targetPath: restoreJob.targetPath ?? '',
+              selectedPaths: resolvedSelectedPaths,
+              // A reference only: resolved when the command is delivered.
+              ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
+            },
+            { userId: auth.user?.id ?? undefined }
+          );
 
-        if (error) {
-          await markRestoreJobFailed(restoreJob.id, error);
-          return JSON.stringify({ error });
+          if (error) return { refused: error };
+          if (!command?.id) return { refused: 'Restore command was queued without a command ID' };
+
+          const now = new Date();
+          const [updatedRestoreJob] = await db
+            .update(restoreJobs)
+            .set({
+              commandId: command.id,
+              status: command.status === 'sent' ? 'running' : restoreJob.status,
+              startedAt: command.status === 'sent' ? now : restoreJob.startedAt,
+              updatedAt: now,
+            })
+            .where(eq(restoreJobs.id, restoreJob.id))
+            .returning();
+          return { refused: undefined, command, updatedRestoreJob };
+        });
+
+        if (dispatched.refused !== undefined) {
+          await markRestoreJobFailed(restoreJob.id, dispatched.refused);
+          return JSON.stringify({ error: dispatched.refused });
         }
-
-        if (!command?.id) {
-          const fallbackError = 'Restore command was queued without a command ID';
-          await markRestoreJobFailed(restoreJob.id, fallbackError);
-          return JSON.stringify({ error: fallbackError });
-        }
-
-        const now = new Date();
-        const [updatedRestoreJob] = await db
-          .update(restoreJobs)
-          .set({
-            commandId: command.id,
-            status: command.status === 'sent' ? 'running' : restoreJob.status,
-            startedAt: command.status === 'sent' ? now : restoreJob.startedAt,
-            updatedAt: now,
-          })
-          .where(eq(restoreJobs.id, restoreJob.id))
-          .returning();
+        const { command, updatedRestoreJob } = dispatched;
 
         return JSON.stringify({
           success: true,
@@ -814,9 +889,12 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           message: `Restore job created (${restoreType} restore from snapshot ${snapshot.providerSnapshotId})`,
         });
       } catch (err) {
-        const error = err instanceof Error ? err.message : 'Failed to dispatch restore command to agent';
+        // A fixed message: target_config is tenant- and model-readable, the raw
+        // error goes to the log.
+        const error = 'Failed to dispatch restore command to agent';
+        console.error('[aiToolsBackup] Failed to dispatch restore:', safeErrorMessage(err));
         await markRestoreJobFailed(restoreJob.id, error);
-        return JSON.stringify({ error: 'Failed to dispatch restore command to agent' });
+        return JSON.stringify({ error });
       }
     }),
   });

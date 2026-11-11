@@ -28,6 +28,27 @@ build. Other portal/schema paths remain unsupported until explicitly covered.
 This wiring is separate from real Windows/browser acceptance and does not enable
 or prove the unfinished native RustDesk transport.
 
+## Reviewed cumulative feature groups
+
+`.github/cloudcom-reviewed-impacts.json` registers exact additional fork paths with their behavioral tests and commands. `scripts/cloudcom/validate-reviewed-fork.mjs` selects groups from the complete diff against the pinned upstream baseline and runs them serially. This supplements the older focused gates; it does not enable all upstream workflows or claim full upstream CI coverage. A neighboring unregistered product path still fails classification. Adding a path requires a reviewed source/test mapping and a real validation command, not a blanket directory allowlist.
+
+| Group | Required validation |
+| --- | --- |
+| API runtime | Named alert, capacity, rollout, integration, authentication and Companion service tests; API bundle build |
+| Database and security | Database unit tests; disposable PostgreSQL and Redis; core migrations replayed; extension migrations replayed; real Harmony isolation/publication, prepared-query RLS, device identity and atomic rollout tests; RLS coverage and tenant export/erasure |
+| Browser Companion | Package Node behavioral tests |
+| Credentials and notes | Extension typecheck, server/import tests, browser tests and web bundle |
+| Cloud Command | Extension typecheck, server and browser suites and web bundle |
+| Web UI | Named changed UI tests and web/portal builds |
+| Shared contracts | Google delegation scope tests and consuming extension typechecks |
+| Release artifacts | Version, signed-artifact and viewer-updater tests; compose generation tests; promotion script syntax |
+
+The Linux runner requires Docker Compose, Node/pnpm, Python 3, Bash and `zip` (the native updater packaging contract uses a real STORED archive). Missing tools fail the gate; they are not grounds to skip packaging tests.
+
+The database gate owns fixed loopback-only disposable ports and never accepts production database endpoints. It explicitly enables the opt-in real Redis, prepared-policy and device-identity tests; an unset opt-in variable must not be mistaken for a successful proof. Container teardown runs on exit. The runner stops on the first failing command, and skipped or unexecuted groups must be reported as such. Classifier tests alone prove routing, not product behavior.
+
+Windows acceptance is separate: validate the actual signed candidate binaries on the Windows test endpoint, including service startup/update, sign-in and locked desktop capture, Web Remote, and the managed RustDesk direct/relay paths appropriate to the change. Linux tests, bundling, structural contracts and this manifest do not establish Windows desktop or installer acceptance. Production promotion also requires the exact final commit's CI result, restored-database rehearsal, provenance and rollback checks described below.
+
 ## Release updates
 
 The upstream workflow checks published stable LanternOps/breeze releases weekly on Monday at 10:23 UTC and can be run manually from the default branch. Schedules become active only after this workflow is on the default branch. GitHub Actions must be permitted to create PRs; default workflow permissions stay read-only and the updater grants only its job the required write permissions.

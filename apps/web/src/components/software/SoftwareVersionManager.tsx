@@ -15,7 +15,9 @@ import {
   deriveSoftwareFileTypeFromUrl,
   formatSuccessExitCodes,
   parseSuccessExitCodesText,
+  validateSoftwareVersionInstallSpec,
   type DetectionRule,
+  type InstallSpecIssue,
   type SoftwareFileType,
 } from "@breeze/shared";
 import { applySilentArgsPrefill } from "@/lib/installerArgsPrefill";
@@ -27,6 +29,7 @@ import { applyOsHint } from "@/lib/installerPackageHints";
 import { bumpVersionString, substituteVersionInUrl } from "@/lib/versionBump";
 import { uploadPackageVersion } from "../../lib/softwarePackageUpload";
 import DetectionRulesEditor from "./DetectionRulesEditor";
+import InstallScriptsFields from "./InstallScriptsFields";
 import VariableInput, { type DeviceCustomField } from "./VariableInput";
 import { useTenantVariables } from "@/lib/tenantVariableTokens";
 import { useTranslation } from "react-i18next";
@@ -54,15 +57,17 @@ type VersionEntry = {
   installScriptsEnabled: boolean;
 };
 
+const isPresentScript = (v: string | null) => typeof v === "string" && v.trim() !== "";
+function hasStoredScripts(entry: VersionEntry): boolean {
+  return isPresentScript(entry.preInstallScript) || isPresentScript(entry.postInstallScript);
+}
 /** A version holding scripts that were stored but never enabled (pre-#6958, or a writer without devices.execute). */
 function hasInactiveStoredScripts(entry: VersionEntry): boolean {
-  const present = (v: string | null) => typeof v === "string" && v.trim() !== "";
-  return (present(entry.preInstallScript) || present(entry.postInstallScript)) && !entry.installScriptsEnabled;
+  return hasStoredScripts(entry) && !entry.installScriptsEnabled;
 }
-
-// The add-version form has no script fields, and the API rejects a zip
-// without a post-install script, so zip is offered only from Add Package.
-const VERSION_FORM_FILE_TYPES = SOFTWARE_FILE_TYPES.filter((t) => t !== "zip");
+/** Installer types that take no silent-install args; the API rejects new ones
+ *  (validateSoftwareVersionInstallSpec, #9983), so the form never offers them. */
+const ARGS_HIDDEN_FILE_TYPES: ReadonlySet<string> = new Set(["pkg", "dmg", "deb", "zip"]);
 function formatDate(dateString: string, timezone?: string): string {
   const date = new Date(dateString);
   if (Number.isNaN(date.getTime())) return dateString;
@@ -164,6 +169,10 @@ const EMPTY_FORM = {
   // submit time. Codes ADD to the agent's built-in success codes (0 always;
   // 3010/1641 for exe/msi) — they never replace them.
   successExitCodesRaw: "",
+  // #10037: editable on add (seeded from the latest version); shown read-only
+  // on edit, because the PATCH route keeps a version's scripts immutable.
+  preInstallScript: "",
+  postInstallScript: "",
   file: null as File | null,
   fileName: "",
 };
@@ -177,12 +186,25 @@ interface SoftwareVersionManagerProps {
   /** #6958: a Breeze-pinned built-in (builtinPackageKey set). Versions are
    *  managed by Breeze: no add, edit or promote here (the API answers 403). */
   builtinReadOnly?: boolean;
+  /** Who owns the package (#11412). Partner-owned packages are written through
+   *  the same upload routes, but only by a full-partner admin. */
+  ownerScope?: "organization" | "partner";
+  /** The signed-in user's `canManagePartnerWide`. Only an explicit `false`
+   *  disables the form; `undefined` (not loaded yet) leaves it enabled and the
+   *  server still answers 403. */
+  canManagePartnerWide?: boolean;
+  /** Set on a built-in integration package: blank install args default to the
+   *  package's own template server-side. */
+  integrationProvider?: "huntress" | "sentinelone";
 }
 export default function SoftwareVersionManager({
   timezone,
   catalogId: propCatalogId,
   embedded = false,
   builtinReadOnly = false,
+  ownerScope = "organization",
+  canManagePartnerWide,
+  integrationProvider,
 }: SoftwareVersionManagerProps) {
   useTranslation("policies");
   const [versions, setVersions] = useState<VersionEntry[]>([]);
@@ -205,6 +227,8 @@ export default function SoftwareVersionManager({
   // Without S3 configured the upload routes 503, so gray the file picker out
   // up front instead of failing after the user chose a file.
   const { enabled: uploadsEnabled } = usePackageUploadsGate();
+  const partnerWriteBlocked =
+    ownerScope === "partner" && canManagePartnerWide === false;
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Owns the in-flight chunked upload so Cancel (and unmount) can actually stop
   // it. A ref, not state: it must survive re-renders without causing one, and
@@ -344,6 +368,13 @@ export default function SoftwareVersionManager({
     () => versions.find((item) => item.id === selectedVersionId) ?? versions[0],
     [versions, selectedVersionId],
   );
+  // Built-in integration packages (SentinelOne, Huntress) take their server
+  // default template when the field is blank; the generic msiexec prefill
+  // would fail server validation (e.g. missing {s1_site_token}).
+  const prefillSilentArgs = (
+    current: { silentInstallArgs: string; silentUninstallArgs: string },
+    nextFileType: SoftwareFileType | null,
+  ) => (integrationProvider ? {} : applySilentArgsPrefill(current, nextFileType));
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -352,7 +383,7 @@ export default function SoftwareVersionManager({
       file,
       fileName: file.name,
       // Auto-populate MSI silent args (retractable — see applySilentArgsPrefill).
-      ...applySilentArgsPrefill(prev, deriveSoftwareFileTypeFromUrl(file.name)),
+      ...prefillSilentArgs(prev, deriveSoftwareFileTypeFromUrl(file.name)),
       ...applyOsHint(prev, file.name),
     }));
   };
@@ -364,7 +395,7 @@ export default function SoftwareVersionManager({
     setFormState((prev) => ({
       ...prev,
       downloadUrl: value,
-      ...applySilentArgsPrefill(
+      ...prefillSilentArgs(
         prev,
         prev.fileType || deriveSoftwareFileTypeFromUrl(value),
       ),
@@ -378,7 +409,7 @@ export default function SoftwareVersionManager({
     setFormState((prev) => ({
       ...prev,
       fileType: value,
-      ...applySilentArgsPrefill(
+      ...prefillSilentArgs(
         prev,
         value || deriveSoftwareFileTypeFromUrl(prev.downloadUrl),
       ),
@@ -388,6 +419,50 @@ export default function SoftwareVersionManager({
     () => deriveSoftwareFileTypeFromUrl(formState.downloadUrl),
     [formState.downloadUrl],
   );
+  const editingEntry = editingVersionId
+    ? versions.find((v) => v.id === editingVersionId)
+    : undefined;
+  // The type the server will end up with: an upload derives it from the
+  // filename; the URL source honors the selector, else the URL (same rule as
+  // AddPackageModal).
+  const effectiveFileType: SoftwareFileType | null = formState.file
+    ? deriveSoftwareFileTypeFromUrl(formState.fileName)
+    : formState.fileType || inferredFileType;
+  // On edit the PATCH cannot change the type, and the API judges args against
+  // the STORED type, so that is what decides here.
+  const argsHidden = editingEntry
+    ? ARGS_HIDDEN_FILE_TYPES.has(editingEntry.fileType)
+    : effectiveFileType !== null && ARGS_HIDDEN_FILE_TYPES.has(effectiveFileType);
+  // Active scripts bind a version to its one OS (they pick the interpreter);
+  // the PATCH route rejects any change, so the checkboxes lock.
+  const osLocked = Boolean(
+    editingEntry?.installScriptsEnabled && hasStoredScripts(editingEntry),
+  );
+  // Scripts are only validated where they are written: on add. An edit never
+  // sends them, and the API checks the OS rule itself.
+  const installSpecIssues: InstallSpecIssue[] = editingVersionId
+    ? []
+    : validateSoftwareVersionInstallSpec({
+        fileType: effectiveFileType,
+        supportedOs: formState.supportedOs,
+        silentInstallArgs: argsHidden ? null : formState.silentInstallArgs,
+        preInstallScript: formState.preInstallScript,
+        postInstallScript: formState.postInstallScript,
+      });
+  const scriptsPayload = {
+    preInstallScript: formState.preInstallScript.trim()
+      ? formState.preInstallScript
+      : undefined,
+    postInstallScript: formState.postInstallScript.trim()
+      ? formState.postInstallScript
+      : undefined,
+  };
+  // Args on a type that takes none are never sent: omitted on create, and left
+  // untouched (not cleared) on edit, since the installer ignores them anyway.
+  const createArgs =
+    argsHidden || !formState.silentInstallArgs
+      ? undefined
+      : formState.silentInstallArgs;
   const resetForm = () => {
     setFormState(EMPTY_FORM);
     setEditingVersionId("");
@@ -421,6 +496,14 @@ export default function SoftwareVersionManager({
             supportedOs: [...seed.supportedOs],
             detectionRules: seed.detectionRules.map((r) => ({ ...r })),
             successExitCodesRaw: formatSuccessExitCodes(seed.successExitCodes),
+            // Only active scripts carry over: a routine new release must not
+            // start running a dormant script as SYSTEM/root unasked.
+            ...(seed.installScriptsEnabled
+              ? {
+                  preInstallScript: seed.preInstallScript ?? "",
+                  postInstallScript: seed.postInstallScript ?? "",
+                }
+              : {}),
           }
         : EMPTY_FORM,
     );
@@ -449,6 +532,8 @@ export default function SoftwareVersionManager({
       supportedOs: [...entry.supportedOs],
       detectionRules: entry.detectionRules.map((r) => ({ ...r })),
       successExitCodesRaw: formatSuccessExitCodes(entry.successExitCodes),
+      preInstallScript: entry.preInstallScript ?? "",
+      postInstallScript: entry.postInstallScript ?? "",
     });
     setAdvancedOpen(
       Boolean(
@@ -510,6 +595,7 @@ export default function SoftwareVersionManager({
     if (!formState.version.trim()) return;
     if (!catalogId) return;
     if (!successExitCodesResult.ok) return;
+    if (installSpecIssues.length > 0) return;
     // Edit mode: metadata PATCH — no file handling, empty string clears.
     if (editingVersionId) {
       try {
@@ -524,7 +610,9 @@ export default function SoftwareVersionManager({
               architecture: formState.architecture,
               releaseNotes: formState.notes.trim() || null,
               downloadUrl: formState.downloadUrl.trim() || null,
-              silentInstallArgs: formState.silentInstallArgs || null,
+              ...(argsHidden
+                ? {}
+                : { silentInstallArgs: formState.silentInstallArgs || null }),
               silentUninstallArgs: formState.silentUninstallArgs || null,
               supportedOs:
                 formState.supportedOs.length > 0 ? formState.supportedOs : null,
@@ -587,7 +675,8 @@ export default function SoftwareVersionManager({
             version: formState.version.trim(),
             architecture: formState.architecture,
             releaseNotes: formState.notes || undefined,
-            silentInstallArgs: formState.silentInstallArgs || undefined,
+            silentInstallArgs: createArgs,
+            ...scriptsPayload,
             silentUninstallArgs: formState.silentUninstallArgs || undefined,
             downloadUrl: formState.downloadUrl || undefined,
             supportedOs:
@@ -652,7 +741,8 @@ export default function SoftwareVersionManager({
               version: formState.version.trim(),
               releaseNotes: formState.notes || undefined,
               architecture: formState.architecture,
-              silentInstallArgs: formState.silentInstallArgs || undefined,
+              silentInstallArgs: createArgs,
+              ...scriptsPayload,
               silentUninstallArgs: formState.silentUninstallArgs || undefined,
               downloadUrl: formState.downloadUrl || undefined,
               // Omitted on "auto" so the server infers from the URL.
@@ -672,12 +762,18 @@ export default function SoftwareVersionManager({
             }),
           },
         );
-        if (!response.ok)
+        if (!response.ok) {
+          // Pass the server's refusal through (e.g. scripts need
+          // devices.execute, an install-spec issue) — same as the edit path.
+          const errData = await response.json().catch(() => ({}));
           throw new Error(
-            i18n.t(
-              "policies:software.softwareVersionManager.failedToCreateVersion",
-            ),
+            typeof errData.error === "string"
+              ? errData.error
+              : i18n.t(
+                  "policies:software.softwareVersionManager.failedToCreateVersion",
+                ),
           );
+        }
         const newVersionData = await response.json();
         const newVersion = normalizeVersion(
           newVersionData.data ?? newVersionData,
@@ -723,7 +819,9 @@ export default function SoftwareVersionManager({
       </div>
     );
   }
-  if (error && versions.length === 0) {
+  // LOAD failures only: a rejected create/save keeps the form (and the typed
+  // input) mounted and shows the error inline below.
+  if (error && versions.length === 0 && !isFormOpen) {
     return (
       <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
         <p className="text-sm text-destructive">{error}</p>
@@ -879,7 +977,7 @@ export default function SoftwareVersionManager({
               )}{" "}
               <code className="font-mono">
                 {'{{org.name}}'}
-              </code>
+              </code>{" "}
               {i18n.t(
                 "policies:software.softwareVersionManager.resolvePerOrganizationAtDeployTime",
               )}
@@ -903,7 +1001,9 @@ export default function SoftwareVersionManager({
                   onChange={(e) =>
                     handleFileTypeChange(e.target.value as "" | SoftwareFileType)
                   }
-                  className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
+                  // The PATCH route has no fileType: a version's type is fixed.
+                  disabled={Boolean(editingVersionId)}
+                  className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <option value="">
                     {inferredFileType
@@ -915,21 +1015,12 @@ export default function SoftwareVersionManager({
                           "policies:software.softwareVersionManager.autoDetectFromUrl",
                         )}
                   </option>
-                  {/* Editing an existing zip version keeps its type selectable. */}
-                  {(formState.fileType === "zip"
-                    ? SOFTWARE_FILE_TYPES
-                    : VERSION_FORM_FILE_TYPES
-                  ).map((t) => (
+                  {SOFTWARE_FILE_TYPES.map((t) => (
                     <option key={t} value={t}>
                       {t.toUpperCase()}
                     </option>
                   ))}
                 </select>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {i18n.t(
-                    "policies:software.softwareVersionManager.addZipFromAddPackage",
-                  )}
-                </p>
                 {formState.downloadUrl.trim() !== "" &&
                   !formState.fileType &&
                   !inferredFileType && (
@@ -960,6 +1051,7 @@ export default function SoftwareVersionManager({
                   <input
                     type="checkbox"
                     checked={formState.supportedOs.includes(os.toLowerCase())}
+                    disabled={osLocked}
                     onChange={(event) => {
                       const value = os.toLowerCase();
                       setFormState((prev) => ({
@@ -976,6 +1068,17 @@ export default function SoftwareVersionManager({
               ))}
             </div>
           </div>
+
+          {partnerWriteBlocked && (
+            <p
+              className="mt-4 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="partner-wide-requires-full-access"
+            >
+              {i18n.t(
+                "policies:software.softwareVersionManager.partnerWideRequiresFullAccess",
+              )}
+            </p>
+          )}
 
           {editingVersionId ? (
             /* The uploaded binary is immutable per version — replacing the
@@ -994,13 +1097,13 @@ export default function SoftwareVersionManager({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".msi,.exe,.dmg,.deb,.pkg"
+                accept=".msi,.exe,.dmg,.deb,.pkg,.zip"
                 onChange={handleFileChange}
                 className="hidden"
               />
               <button
                 type="button"
-                disabled={!uploadsEnabled}
+                disabled={!uploadsEnabled || partnerWriteBlocked}
                 title={
                   uploadsEnabled
                     ? undefined
@@ -1028,6 +1131,11 @@ export default function SoftwareVersionManager({
           </div>
           )}
 
+          {argsHidden ? (
+            <p className="mt-4 text-xs text-muted-foreground">
+              {i18n.t("policies:software.addPackageModal.silentArgsNotUsedForType")}
+            </p>
+          ) : (
           <div className="mt-4">
             <label className="text-xs font-semibold uppercase text-muted-foreground">
               {i18n.t(
@@ -1050,7 +1158,54 @@ export default function SoftwareVersionManager({
                 tenantVariables={tenantVariables}
               />
             </div>
+            {integrationProvider && (
+              <p
+                className="mt-1 text-xs text-muted-foreground"
+                data-testid="builtin-args-default"
+              >
+                {i18n.t(
+                  "policies:software.softwareVersionManager.builtinArgsDefault",
+                )}
+              </p>
+            )}
           </div>
+          )}
+
+          {!editingVersionId ? (
+            <div className="mt-4">
+              <InstallScriptsFields
+                idPrefix="version"
+                preInstallScript={formState.preInstallScript}
+                postInstallScript={formState.postInstallScript}
+                onPreInstallScriptChange={(value) =>
+                  setFormState((prev) => ({ ...prev, preInstallScript: value }))
+                }
+                onPostInstallScriptChange={(value) =>
+                  setFormState((prev) => ({ ...prev, postInstallScript: value }))
+                }
+                issues={installSpecIssues}
+              />
+            </div>
+          ) : editingEntry && hasStoredScripts(editingEntry) ? (
+            <div className="mt-4">
+              <InstallScriptsFields
+                idPrefix="version"
+                preInstallScript={formState.preInstallScript}
+                postInstallScript={formState.postInstallScript}
+                readOnly
+                notice={
+                  <p
+                    className="mt-1 text-xs text-muted-foreground"
+                    data-testid="install-scripts-readonly"
+                  >
+                    {i18n.t(
+                      "policies:software.softwareVersionManager.installScriptsReadOnlyOnEdit",
+                    )}
+                  </p>
+                }
+              />
+            </div>
+          ) : null}
 
           {/* Advanced disclosure mirrors AddPackageModal: uninstall args,
               detection rules and release notes stay out of the default view.
@@ -1201,7 +1356,13 @@ export default function SoftwareVersionManager({
             </button>
             <button
               type="submit"
-              disabled={saving || tokenErrors.length > 0 || !successExitCodesResult.ok}
+              disabled={
+                saving ||
+                partnerWriteBlocked ||
+                tokenErrors.length > 0 ||
+                !successExitCodesResult.ok ||
+                installSpecIssues.length > 0
+              }
               className="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {editingVersionId

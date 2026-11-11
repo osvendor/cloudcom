@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% di affidabilità"
   },
   "alertDetailPage": {
+    "externalTickets": "Ticket esterni",
+    "externalTicketsFailedToLoad": "Impossibile caricare i ticket esterni.",
     "loadingAlert": "Caricamento avviso...",
     "backToAlerts": "Torna agli avvisi",
     "goBack": "Indietro",
@@ -82,6 +84,21 @@
       "resolved": "Risolto",
       "suppressed": "Soppresso",
       "dismissed": "Ignorato"
+    },
+    "createPsaTicket": "Crea ticket PSA",
+    "psaTicketRequested": "Ticket PSA richiesto",
+    "failedToCreatePsaTicket": "Impossibile richiedere il ticket PSA",
+    "lifecycleLine": {
+      "text": "{{rearm}} · raffreddamento {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Si riattiva con nuove evidenze",
+      "rearmAfterDelay": "Si riattiva dopo {{minutes}} min",
+      "sources": {
+        "monitor": "questo monitor",
+        "org": "predefinito dell'organizzazione",
+        "partner": "predefinito del partner",
+        "builtin": "predefinito integrato",
+        "legacy": "regola di avviso"
+      }
     }
   },
   "alertDetails": {
@@ -652,6 +669,7 @@
       "info": "Info"
     },
     "status": {
+      "open": "Aperto",
       "active": "Attivo",
       "acknowledged": "Confermato",
       "resolved": "Risolto",
@@ -965,5 +983,10 @@
       "body": "I modelli esistenti restano modificabili qui e verranno convertiti nella prossima versione.",
       "link": "Apri Monitor"
     }
+  },
+  "subject": {
+    "label": "Elemento interessato",
+    "backupWorkload": "Carico di backup",
+    "topologySite": "Sito topologico"
   }
 }

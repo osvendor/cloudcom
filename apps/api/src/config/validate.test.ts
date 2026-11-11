@@ -351,6 +351,28 @@ describe('validateConfig', () => {
     });
   });
 
+  describe('Portal Entra app (portal registration W4)', () => {
+    const portalEntra = {
+      PORTAL_ENTRA_CLIENT_ID: '44444444-4444-4444-8444-444444444444',
+      PORTAL_ENTRA_CLIENT_SECRET: 'portal-entra-secret',
+    };
+
+    it('refuses boot when the app is configured with a malformed callback base', () => {
+      withEnv({ ...validEnv, ...portalEntra, PORTAL_ENTRA_CALLBACK_BASE_URL: 'https://portal.example.test/sub/path' }, () => {
+        expect(() => validateConfig()).toThrow(/PORTAL_ENTRA_CALLBACK_BASE_URL/);
+      });
+    });
+
+    it('boots with a valid base, and ignores the base entirely when the app is not configured', () => {
+      withEnv({ ...validEnv, ...portalEntra, PORTAL_ENTRA_CALLBACK_BASE_URL: 'https://portal.example.test' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+      withEnv({ ...validEnv, PORTAL_ENTRA_CLIENT_ID: '', PORTAL_ENTRA_CALLBACK_BASE_URL: 'not a url' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+  });
+
   describe('M365 customer Graph-actions onboarding + reveal key', () => {
     it('refuses boot when actions onboarding is enabled without a complete descriptor', () => {
       withEnv({
@@ -1348,6 +1370,60 @@ describe('validateConfig', () => {
       warnSpy.mockRestore();
     },
   );
+
+  // #8313 W1 review finding 6.
+  it.each(['2e9', '2GiB', '2_147_483_648', '12abc', '0'])(
+    'warns at boot, naming the variable, when TICKET_IMPORT_MAX_BYTES_PER_HOUR=%j is not a plain positive integer',
+    (value) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      withEnv({ ...validEnv, TICKET_IMPORT_MAX_BYTES_PER_HOUR: value }, () => {
+        validateConfig();
+        const lines = warnSpy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('TICKET_IMPORT_MAX_BYTES_PER_HOUR'));
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain('2147483648');
+      });
+      warnSpy.mockRestore();
+    },
+  );
+
+  it.each(['2147483648', '52428800', ''])('does not warn about TICKET_IMPORT_MAX_BYTES_PER_HOUR=%j', (value) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, TICKET_IMPORT_MAX_BYTES_PER_HOUR: value }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.some((args) => String(args[0]).includes('TICKET_IMPORT_MAX_BYTES_PER_HOUR'))).toBe(false);
+    });
+    warnSpy.mockRestore();
+  });
+
+  // #8313 W4: the ticket import worker's knobs.
+  it.each([
+    ['TICKET_IMPORT_SLICE_MS', '5min'],
+    ['TICKET_IMPORT_LEASE_MS', '-1'],
+    ['TICKET_IMPORT_MAX_TICKET_BYTES', '256MiB'],
+  ])('warns at boot when %s=%j is not a plain positive integer', (key, value) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, [key]: value }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.filter((args) => String(args[0]).includes(key))).toHaveLength(1);
+    });
+    warnSpy.mockRestore();
+  });
+
+  it('warns when the import lease cap is not below the worker concurrency, and not otherwise', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, TICKET_IMPORT_WORKER_CONCURRENCY: '3', TICKET_IMPORT_GLOBAL_CONCURRENCY: '3' }, () => {
+      validateConfig();
+      const lines = warnSpy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('TICKET_IMPORT_GLOBAL_CONCURRENCY'));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('2 applies');
+    });
+    warnSpy.mockClear();
+    withEnv({ ...validEnv, TICKET_IMPORT_WORKER_CONCURRENCY: '4', TICKET_IMPORT_GLOBAL_CONCURRENCY: '3' }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.some((args) => String(args[0]).includes('TICKET_IMPORT_'))).toBe(false);
+    });
+    warnSpy.mockRestore();
+  });
 
   it('rejects short AGENT_ENROLLMENT_SECRET in production when configured', () => {
     withEnv({
@@ -3099,6 +3175,41 @@ describe('validateConfig', () => {
     });
   });
 
+  // Vendor updates (#11065): the lab override opens closed firmware gates, so it
+  // never reaches production. A typo in the kill switch would silently not stop a lane.
+  it('refuses BREEZE_OEM_UPDATES_LAB_DEVICE_IDS under NODE_ENV=production', () => {
+    withEnv({ ...workspaceProdEnv, BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: '11111111-1111-4111-8111-111111111111' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_LAB_DEVICE_IDS must not be set in production/);
+    });
+  });
+
+  it('allows BREEZE_OEM_UPDATES_LAB_DEVICE_IDS outside production', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: '11111111-1111-4111-8111-111111111111' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('rejects a non-boolean BREEZE_OEM_UPDATES_ENABLED', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_ENABLED: 'maybe' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_ENABLED must be a boolean/);
+    });
+  });
+
+  it('rejects a partner allowlist that parses to nothing: empty means every partner', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST: ' , ,' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST/);
+    });
+  });
+
+  it('rejects an unknown lane in BREEZE_OEM_UPDATES_DISABLED_LANES', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_DISABLED_LANES: 'dell,dels' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_DISABLED_LANES.*dels/);
+    });
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_DISABLED_LANES: 'dell, HP' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
   // computePriceMultiplier() falls back to 1 for anything unparseable, silently.
   // Without a boot-time refusal a typo runs at 1x forever and only ever surfaces
   // as a margin discrepancy nobody traces back to an env var.
@@ -4261,6 +4372,38 @@ describe('empty-string compose passthrough (#7640)', () => {
   it('still requires MCP_LLM_BASE_URL when provider is openai-compatible and the base URL is empty', () => {
     withEnv({ ...validEnv, IS_HOSTED: 'false', MCP_LLM_PROVIDER: 'openai-compatible', MCP_LLM_BASE_URL: '', MCP_LLM_MODEL: 'm' }, () => {
       expect(() => validateConfig()).toThrow(/MCP_LLM_BASE_URL is required/);
+    });
+  });
+});
+
+// #9700: INTERNAL_SERVICE_CIDRS exempts the in-cluster plain-HTTP hop from
+// FORCE_HTTPS. It must name a private network — a public or all-addresses range
+// would let internet clients claim the internal exemption.
+describe('INTERNAL_SERVICE_CIDRS validation (#9700)', () => {
+  it('accepts the compose bridge subnet', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '172.31.0.0/24' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('accepts unset (exemption disabled)', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it.each(['0.0.0.0/0', '::/0', '203.0.113.0/24', 'not-a-cidr', '172.31.0.0/99', '10.0.0.0/1', '172.16.0.0/8', 'fc00::/1'])(
+    'refuses %j',
+    (entry) => {
+      withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: `172.31.0.0/24,${entry}` }, () => {
+        expect(() => validateConfig()).toThrow(/INTERNAL_SERVICE_CIDRS/);
+      });
+    },
+  );
+
+  it('refuses an INTERNAL_API_HOSTS entry that is not a bare host[:port]', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '172.31.0.0/24', INTERNAL_API_HOSTS: 'http://api:3001/x' }, () => {
+      expect(() => validateConfig()).toThrow(/INTERNAL_API_HOSTS/);
     });
   });
 });

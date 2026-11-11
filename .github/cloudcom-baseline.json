@@ -1,7 +1,7 @@
 {
   "repository": "LanternOps/breeze",
-  "tag": "v0.125.0",
-  "commit": "47ac95f5792ee66f5545ae5a3ba183a9a2014631",
-  "forkVersion": "0.125.5",
-  "binariesVersion": "0.123.5"
+  "tag": "v0.128.0",
+  "commit": "a92212fcff9da71046d3e0feb3fbb3c6b31fd920",
+  "forkVersion": "0.128.5",
+  "binariesVersion": "0.125.5"
 }

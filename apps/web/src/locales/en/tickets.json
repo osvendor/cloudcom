@@ -137,9 +137,14 @@
       "remove": "Remove file",
       "tooMany": "You can attach at most {{max}} files to one comment.",
       "tooLarge": "{{name}} is larger than 10 MB.",
-      "sentWithoutAttachment_one": "Note posted, but the attachment could not be added. Retry or remove it.",
-      "sentWithoutAttachment_other": "Note posted, but {{count}} attachments could not be added. Retry or remove them."
-    }
+      "rejectedType": "{{name}} was not attached: only JPEG, PNG, WebP images and PDFs are supported.",
+      "rejectedEmpty": "{{name}} was not attached: the file is empty.",
+      "sentWithoutAttachmentReply_one": "Reply posted, but the attachment could not be added. Retry or remove it.",
+      "sentWithoutAttachmentNote_one": "Note posted, but the attachment could not be added. Retry or remove it.",
+      "sentWithoutAttachmentReply_other": "Reply posted, but {{count}} attachments could not be added. Retry or remove them.",
+      "sentWithoutAttachmentNote_other": "Note posted, but {{count}} attachments could not be added. Retry or remove them."
+    },
+    "modeLabel": "Comment visibility"
   },
   "ticketFeed": {
     "empty": "No activity yet.",
@@ -416,7 +421,18 @@
     },
     "filterByType": "Filter by type",
     "allTypes": "All types",
-    "showMerged": "Show merged"
+    "showMerged": "Show merged",
+    "shortcutsButton": "Shortcuts",
+    "announce": {
+      "ticket": "{{number}} {{subject}}, {{priority}} priority",
+      "ticketWithSla": "{{number}} {{subject}}, {{priority}} priority, {{sla}}",
+      "sla": {
+        "ok": "SLA {{relative}} left",
+        "atRisk": "SLA at risk, {{relative}} left",
+        "paused": "SLA paused, {{relative}} left",
+        "breached": "SLA breached"
+      }
+    }
   },
   "ticketWorkbench": {
     "notFound": "Ticket not found. It may have been deleted, or you may not have access to it.",
@@ -566,7 +582,8 @@
       "pending": "This ticket was merged into another ticket on {{date}}.",
       "deleted": "This ticket was merged on {{date}} into a ticket that was deleted or that you cannot see.",
       "open": "Open {{number}}",
-      "readOnly": "Merged tickets are read-only. Reply on the ticket it was merged into."
+      "readOnly": "Merged tickets are read-only. Reply on the ticket it was merged into.",
+      "railReadOnly": "Time, billing and parts are read-only on a merged ticket. Log time and parts on the ticket it was merged into."
     },
     "triage": {
       "title": "Suggested triage",

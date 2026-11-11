@@ -26,6 +26,7 @@ import { resolveRecipientUserIds } from '../services/aiAgents/recipients';
 import { transitionIntent, type ActionIntentTransitionPatch } from '../services/actionIntents/intentService';
 import { buildActionLabel } from '../services/actionIntents/actionLabel';
 import { isMcpOriginIntent } from '../services/mcpIntentEligibility';
+import { stripPageResumeJson } from '../services/aiToolPageResume';
 import { beginMcpReleaseLifecycle, writeMcpIntentOutcomeAudit, type McpReleaseLifecycle } from '../services/mcpTier3Lifecycle';
 import {
   beginOperatorReleaseLedger,
@@ -1406,7 +1407,7 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
   // A tool whose pin is MANDATORY (topology diagnose_connectivity, M4-D3) never
   // inherits the NULL-means-nothing-to-check fallback below: no pinned digest
   // is an explicit refusal, before anything executes.
-  if (!hasPinnedDigest(intent) && requiresPinnedEffectDigest(intent.actionName)) {
+  if (!hasPinnedDigest(intent) && requiresPinnedEffectDigest(intent.actionName, intent.arguments as Record<string, unknown> | null)) {
     await failIntent(intent, 'digest_required', { details: { actionName: intent.actionName } });
     return;
   }
@@ -1421,7 +1422,7 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
     let recomputed: { digest: string | null; context?: ToolExecutionContext };
     try {
       recomputed = await withSystemDbAccessContext(() =>
-        computeEffectDigestForRelease(intent.actionName, intent.arguments, db),
+        computeEffectDigestForRelease(intent.actionName, intent.arguments, db, { intentOrgId: intent.orgId }),
       );
     } catch (err) {
       // Fail closed with a categorized code, like every other step in this
@@ -1587,7 +1588,9 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
       // external I/O, so it runs outside any DB context. Its own deadline
       // (≤ 30 s for http_request) is inside the generic tool timeout.
       rawResult = await inFlowFrame(() => withToolTimeout(
-        runOutsideDbContext(() => executeReleasedFlowBuiltin(intent, auth)),
+        // W6 (#5221): the digest recompute's verified material (the fleet
+        // built-in's script snapshot for the frozen devices) rides along.
+        runOutsideDbContext(() => executeReleasedFlowBuiltin(intent, auth, verifiedContext)),
         getToolTimeout(intent.actionName),
         intent.actionName,
       ));
@@ -1760,7 +1763,9 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
   } else if (carrier) {
     storedResult = sealToolSecrets(carrier).sealedResult;
   } else {
-    storedResult = normalizeToolResult(rawResult);
+    // #10385: a paged tool's page-resume descriptor is chat-compaction input,
+    // not part of the result — keep it out of the stored record.
+    storedResult = normalizeToolResult(stripPageResumeJson(rawResult));
   }
 
   // A tool that returned an error body (not a throw) is a FAILED release, not a
@@ -2446,6 +2451,22 @@ async function releaseAndNotify(intentId: string): Promise<{ released: boolean }
   } catch (err) {
     console.error(`[IntentReleaseWorker] outcome notification failed for intent ${intentId}:`, err);
     captureException(err instanceof Error ? err : new Error(String(err)));
+  }
+
+  // Wisp delegation W2 (#11085): a step a device-troubleshooting run proposed
+  // reports its outcome into the Wisp thread. Same rule as above — after the
+  // release, never allowed to undo it. A no-op (`posted: false`) for every
+  // other intent; a redelivered job hits the post's dedupe key, and a failed
+  // one is re-swept by the grant reconciler. Lazy: keeps the Wisp notify
+  // graph off this worker's import closure.
+  try {
+    const { postSpecialistStepOutcome } = await import('../services/wisp/specialistResult');
+    await runOutsideDbContext(() => postSpecialistStepOutcome(intentId));
+  } catch (err) {
+    console.error(`[IntentReleaseWorker] specialist step post-back failed for intent ${intentId}:`, err);
+    captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+      op: 'wisp.specialistResult.release', intentId,
+    });
   }
 
   return { released: true };

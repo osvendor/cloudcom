@@ -10,6 +10,9 @@ import {
   PROMPT_CATALOG,
   PROMPT_LOCALES,
   PromptCatalogError,
+  PROMPT_RESERVED_BRANDS,
+  PROMPT_RESERVED_BRAND_QUALIFIERS,
+  isReservedPromptBrandName,
   negotiatePromptLocale,
   promptMessagePlaceholders,
   renderPromptMessage,
@@ -124,6 +127,47 @@ describe('sanitizePromptPartnerName (shared fixture with the Go agent and Assist
   it('strips a lone surrogate', () => {
     expect(sanitizePromptPartnerName('North\ud800wind')).toBe('Northwind');
   });
+
+  // #10325: the reserved list is data; the Go mirror asserts the same lists.
+  it('reserved brand lists match the shared fixture', () => {
+    expect([...PROMPT_RESERVED_BRANDS]).toEqual(sanitizeFixture.reservedBrands.brands);
+    expect([...PROMPT_RESERVED_BRAND_QUALIFIERS]).toEqual(sanitizeFixture.reservedBrands.qualifiers);
+  });
+});
+
+describe('isReservedPromptBrandName (save-time check, #10325)', () => {
+  it.each([
+    'Microsoft',
+    'Microsoft Support',
+    '  windows   security ',
+    'Apple Help Desk',
+    'Ｍｉｃｒｏｓｏｆｔ',
+    'Micro soft',
+  ])('refuses %j', (name) => {
+    expect(isReservedPromptBrandName(name)).toBe(true);
+  });
+
+  it.each([
+    'Northwind IT',
+    'Northwind Microsoft Partner',
+    'Pineapple IT',
+    '',
+    '   ',
+    // Rejected by the sanitizer for another reason (mixed scripts), not a reserved brand.
+    'Місrosoft Support',
+  ])('allows %j', (name) => {
+    expect(isReservedPromptBrandName(name)).toBe(false);
+  });
+
+  it('agrees with the sanitizer on every fixture case', () => {
+    for (const { input, expected, name } of sanitizeFixture.cases) {
+      if (isReservedPromptBrandName(input)) expect(expected, name).toBeNull();
+    }
+  });
+
+  it('is total over non-strings', () => {
+    expect(isReservedPromptBrandName(undefined as unknown as string)).toBe(false);
+  });
 });
 
 describe('promptIdentityBlockSchema (heartbeat contract with the Go agent)', () => {
@@ -169,8 +213,13 @@ describe('promptIdentityBlockSchema (heartbeat contract with the Go agent)', () 
     ['a zero-byte logo', { ...valid, logo: { sha256: 'a'.repeat(64), mime: 'image/png', bytes: 0 } }],
     ['logo bytes inline (the heartbeat carries metadata only)', { ...valid, logo: { sha256: 'a'.repeat(64), mime: 'image/png', bytes: 1, data: 'AA==' } }],
     ['a name that is not NFKC-folded', { ...valid, partnerName: '\uff2dicrosoft' }],
+    ['a reserved brand partner name (#10325)', { ...valid, partnerName: 'Microsoft Support' }],
   ])('refuses %s', (_label, block) => {
     expect(promptIdentityBlockSchema.safeParse(block).success).toBe(false);
+  });
+
+  it('accepts a name that mentions a brand next to the partner name (#10325)', () => {
+    expect(promptIdentityBlockSchema.safeParse({ ...valid, partnerName: 'Northwind Microsoft Partner' }).success).toBe(true);
   });
 
   it('accepts a 120-code-point astral name', () => {
@@ -219,6 +268,23 @@ describe('renderPromptMessage', () => {
     expect(catalogError(() => renderPromptMessage('common', 'constructor', 'en')).code).toBe('unknown_key');
   });
 
+  // #10190 W06: Assist pre-fills Request Support with this, in the session
+  // prompt's locale, after "Report a problem" on the remote-session pill.
+  it('renders the Report-a-problem draft with the session id in every locale', () => {
+    expect(renderPromptMessage('common', 'chrome.remoteReportDraft', 'en', { sessionId: 's-1' })).toBe(
+      'Problem with remote session s-1:',
+    );
+    expect(renderPromptMessage('common', 'chrome.remoteReportDraft', 'de-DE', { sessionId: 's-1' })).toBe(
+      'Problem mit der Remotesitzung s-1:',
+    );
+    for (const locale of ['en', 'de-DE', 'es-419', 'fr-FR', 'fr-CA', 'it-IT', 'pt-BR', 'tr-TR'] as const) {
+      expect(renderPromptMessage('common', 'chrome.remoteReportDraft', locale, { sessionId: 's-1' })).toContain('s-1');
+    }
+    expect(catalogError(() => renderPromptMessage('common', 'chrome.remoteReportDraft', 'en', {})).code).toBe(
+      'missing_param',
+    );
+  });
+
   it('renders fr-CA distinctly from fr-FR', () => {
     expect(renderPromptMessage('common', 'identity.generic', 'fr-CA')).toBe('Votre équipe de soutien informatique');
     expect(renderPromptMessage('common', 'identity.generic', 'fr-FR')).toBe("Votre équipe d'assistance informatique");
@@ -239,5 +305,106 @@ describe('renderPromptMessage', () => {
     expect(promptMessagePlaceholders('Restart in {remaining} at {time:1767225600000} for {partner}')).toEqual([
       'partner',
     ]);
+  });
+});
+
+// W04 (#10190): the notice.info copy the agent renders (agent/internal/promptkinds).
+describe('notice namespace', () => {
+  const NOTICE_KEYS = [
+    'action.ok',
+    'action.openSettings',
+    'safeMode.title',
+    'safeMode.body',
+    'safeMode.bodyNow',
+    'sessionEnded.title',
+    'sessionEnded.body',
+    'sessionEnded.bodyNoTechnician',
+    'sessionEnded.durationLabel',
+    'sessionEnded.durationMinutes',
+    'sessionEnded.durationUnderMinute',
+    'tcc.title',
+    'tcc.bodyFullDiskAccess',
+    'tcc.bodyOthers',
+    'tcc.missingLabel',
+    'tcc.permission.fullDiskAccess',
+    'tcc.permission.screenRecording',
+    'tcc.permission.accessibility',
+  ];
+
+  it('is registered and carries exactly the keys the agent renders', () => {
+    expect(Object.keys(PROMPT_CATALOG)).toContain('notice');
+    const ns = (PROMPT_CATALOG as Record<string, { messages: Record<string, unknown> }>).notice;
+    expect(Object.keys(ns?.messages ?? {}).sort()).toEqual([...NOTICE_KEYS].sort());
+  });
+
+  it('leaves the safe-mode time to the renderer', () => {
+    expect(renderPromptMessage('notice', 'safeMode.body', 'en', { at: '{time:1767225600000}' })).toContain(
+      '{time:1767225600000}',
+    );
+  });
+
+  it('renders in the session locale', () => {
+    expect(renderPromptMessage('notice', 'action.ok', 'tr-TR')).toBe('Tamam');
+    expect(renderPromptMessage('notice', 'action.openSettings', 'de-DE')).toBe('Einstellungen öffnen');
+    expect(renderPromptMessage('notice', 'sessionEnded.body', 'fr-CA', { technician: 'Dana' })).toContain('Dana');
+  });
+
+  it('needs the technician parameter', () => {
+    expect(() => renderPromptMessage('notice', 'sessionEnded.body', 'en', {})).toThrow(/needs parameter "technician"/);
+  });
+});
+
+// W06 (#10190): the remote.consent and remote.session copy the agent renders
+// (agent/internal/promptkinds/remote.go).
+describe('remote namespace', () => {
+  const REMOTE_KEYS = [
+    'action.allow',
+    'action.deny',
+    'action.endSession',
+    'action.keepSession',
+    'action.reportProblem',
+    'consent.title',
+    'consent.body',
+    'consent.bodyFrom',
+    'consent.bodyOrganization',
+    'consent.bodyGeneric',
+    'consent.expiryProceed',
+    'consent.expiryBlock',
+    'fact.technician',
+    'fact.email',
+    'fact.organization',
+    'fact.started',
+    'session.title',
+    'session.titleFrom',
+    'session.titleOrganization',
+    'session.titleGeneric',
+    'session.body',
+    'session.confirmEnd',
+    'session.endFailed',
+  ];
+
+  it('is registered and carries exactly the keys the agent renders', () => {
+    expect(Object.keys(PROMPT_CATALOG)).toContain('remote');
+    const ns = (PROMPT_CATALOG as Record<string, { messages: Record<string, unknown> }>).remote;
+    expect(Object.keys(ns?.messages ?? {}).sort()).toEqual([...REMOTE_KEYS].sort());
+  });
+
+  it('leaves the consent countdown to the renderer and states the policy consequence', () => {
+    expect(renderPromptMessage('remote', 'consent.expiryProceed', 'en')).toBe('If no one answers, the session starts in {remaining}.');
+    expect(renderPromptMessage('remote', 'consent.expiryBlock', 'en')).toBe('If no one answers, the session is declined in {remaining}.');
+    for (const locale of PROMPT_LOCALES) {
+      expect(renderPromptMessage('remote', 'consent.expiryProceed', locale)).toContain('{remaining}');
+      expect(renderPromptMessage('remote', 'consent.expiryBlock', locale)).toContain('{remaining}');
+    }
+  });
+
+  it('renders the decision labels in the session locale', () => {
+    expect(renderPromptMessage('remote', 'action.deny', 'de-DE')).toBe('Ablehnen');
+    expect(renderPromptMessage('remote', 'action.allow', 'fr-CA')).toBe('Autoriser');
+    expect(renderPromptMessage('remote', 'session.titleFrom', 'pt-BR', { technician: 'Dana', organization: 'Northwind IT' })).toContain('Northwind IT');
+  });
+
+  it('needs its parameters', () => {
+    expect(() => renderPromptMessage('remote', 'session.titleFrom', 'en', { technician: 'Dana' })).toThrow(/needs parameter "organization"/);
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { bootstrapFromCfAccessRedirectDetailed, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
+import { bootstrapFromCfAccessRedirectDetailed, ensureSessionPermissions, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import { navigateTo } from '../../lib/navigation';
 import * as Sentry from '@sentry/astro';
@@ -124,6 +124,8 @@ export default function AuthOverlay() {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
+  const permissionsUnknown = useAuthStore((s) => !!s.user && !Array.isArray(s.user.permissions));
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const recoveryOwnsNavigation = useRef(false);
@@ -362,6 +364,17 @@ export default function AuthOverlay() {
 
     return () => { cancelled = true; };
   }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, recoveryUnavailable, cfBootstrapAttempted, ssoBootstrapAttempted, sessionExpiredReason]);
+
+  // #9927 / #9586: a session whose stored user has no permission list (signup
+  // auto-login, forced-MFA hand-off, a blob persisted before /users/me
+  // answered) would keep every permission-gated nav item hidden until the next
+  // login-page sign-in. Once the access token is in hand, read /users/me once
+  // per session; the store helper owns the once-per-session guard.
+  const hasAccessToken = !!tokens?.accessToken;
+  useEffect(() => {
+    if (isLoading || !isAuthenticated || !hasAccessToken || !permissionsUnknown) return;
+    void ensureSessionPermissions();
+  }, [isLoading, isAuthenticated, hasAccessToken, permissionsUnknown, sessionGeneration]);
 
   // Authenticated with token — fade out then unmount
   const shouldHide = !isChecking && !isLoading && isAuthenticated && !!tokens?.accessToken;

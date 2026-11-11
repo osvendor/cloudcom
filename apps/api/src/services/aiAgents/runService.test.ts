@@ -420,13 +420,20 @@ describe('evaluateAgentTriggerFilters', () => {
       true,
     ],
     // #6749 — lifecycle/administrative alert sources (warranty expiry) never
-    // admit a triage run, even when every other filter matches (severity is
-    // hard-coded critical/high by warrantyAlertEvaluator.ts, so severity
-    // alone can't exclude them). Unconditional exclusion, not opt-in.
+    // admit a triage run, even when every other filter matches (an agent
+    // whose alertSeverities include info/low/medium — warranty's levels since
+    // #10371 — would otherwise admit them, so severity alone can't exclude
+    // them). Unconditional exclusion, not opt-in.
     [
       'warranty_evaluator source is excluded even though severity matches',
       triggers(),
       { ...ctx, source: 'warranty_evaluator' },
+      false,
+    ],
+    [
+      'warranty_evaluator source is excluded at its real lifecycle severity (#10371)',
+      triggers({ alertSeverities: ['info', 'low', 'medium'] }),
+      { ...ctx, severity: 'low', source: 'warranty_evaluator' },
       false,
     ],
     [
@@ -440,6 +447,22 @@ describe('evaluateAgentTriggerFilters', () => {
       triggers(),
       { ...ctx, source: 'network_baseline' },
       true,
+    ],
+    // #11328 — an AI agent's own output alerts (a failed act verification, a
+    // fix that did not hold) publish alert.triggered so a human is paged, but
+    // must never wake an agent: act → verify fails → alert → act again is a
+    // feedback loop bounded only by rate and budget caps.
+    [
+      'ai_agent_act_verify (agent output) is excluded even though severity matches',
+      triggers(),
+      { ...ctx, source: 'ai_agent_act_verify' },
+      false,
+    ],
+    [
+      'ai_agent_fix_watch (agent output) is excluded even though severity matches',
+      triggers(),
+      { ...ctx, source: 'ai_agent_fix_watch' },
+      false,
     ],
   ];
 

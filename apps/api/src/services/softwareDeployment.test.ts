@@ -74,6 +74,8 @@ vi.mock('../db', () => ({
   // routes/scripts.test.ts and tenantVariableResolution.test.ts.
   runOutsideDbContext: <T>(fn: () => T): T => fn(),
   withSystemDbAccessContext: async <T>(fn: () => Promise<T>): Promise<T> => fn(),
+  withDbTransaction: <T>(fn: () => T): T => fn(),
+  withDbTransactionIfHeld: <T>(fn: () => T): T => fn(),
 }));
 
 // Wrap drizzle's condition builders in spies (behavior preserved) so tests can
@@ -994,7 +996,11 @@ describe('createSoftwareDeployment', () => {
     });
 
     expect(result.status).toBe('failed');
-    expect(result.message).toBe('All target devices failed installer variable resolution');
+    // #10307: every device failed for the same reason, so the toast names it.
+    expect(result.message).toBe(
+      'All target devices failed installer variable resolution: ' +
+        'Software deployment templates cannot use secret variable(s) {{var.alpha_secret}}, {{var.zeta_secret}}',
+    );
     expect(dispatchDeviceCommandMock).not.toHaveBeenCalled();
     // One failure row per device, all carrying the same sorted key list.
     const failureWrites = updateSetCalls.filter((c) => c.status === 'failed');
@@ -1050,6 +1056,87 @@ describe('createSoftwareDeployment', () => {
     const payload = dispatchDeviceCommandMock.mock.calls[0]![0].payload;
     expect(payload.downloadUrl).toBe('https://edr.example/agent.exe');
     expect(payload.silentInstallArgs).toBe('/SILENT /TOKEN=abc');
+  });
+
+  describe('framework EDR providers (#8170)', () => {
+    const LINK = 'https://download.example.test/setupdownloader_synthetic.exe';
+    const version = {
+      id: 'ver-fw',
+      catalogId: 'cat-1',
+      s3Key: null,
+      downloadUrl: '{edr_installer_url}',
+      checksum: 'a'.repeat(64),
+      originalFileName: 'GravityZoneInstaller.exe',
+      fileType: 'msi',
+      silentInstallArgs: '{edr_installer_args}',
+      version: 'latest',
+    };
+    const deploy = () => createSoftwareDeployment({
+      orgId: 'org-1',
+      softwareVersionId: 'ver-fw',
+      deploymentType: 'install',
+      deviceIds: ['dev-1'],
+      scheduleType: 'immediate',
+      createdBy: null,
+    });
+    const arrange = (integrationProvider: string, resolves = true) => {
+      selectMock.mockReturnValueOnce(sel([version])).mockReturnValueOnce(sel([{ id: 'cat-1', orgId: null, name: 'Agent', integrationProvider }]));
+      if (resolves) selectMock.mockReturnValueOnce(sel([{ id: 'dev-1', agentId: 'agent-1' }]));
+      insertMock.mockReturnValueOnce(insWithReturning([{ id: 'dep-fw', orgId: 'org-1' }])).mockReturnValueOnce(ins());
+    };
+
+    it('the resolver overrides the file name, file type and checksum, and the payload names the provider', async () => {
+      resolveEdrMock.mockResolvedValueOnce({
+        downloadUrl: LINK,
+        silentInstallArgs: '/bdparams /silent',
+        fileName: 'setupdownloader_synthetic.exe',
+        fileType: 'exe',
+        checksum: null,
+      });
+      arrange('bitdefender');
+      const result = await deploy();
+      expect(result.status).toBe('pending');
+      expect(resolveEdrMock).toHaveBeenLastCalledWith(expect.objectContaining({ provider: 'bitdefender', orgId: 'org-1' }));
+      expect(dispatchDeviceCommandMock.mock.calls[0]![0].payload).toMatchObject({
+        downloadUrl: LINK,
+        silentInstallArgs: '/bdparams /silent',
+        fileName: 'setupdownloader_synthetic.exe',
+        fileType: 'exe',
+        checksum: null,
+        integrationProvider: 'bitdefender',
+      });
+    });
+
+    it.each(['emsisoft', 'not-a-provider'])('%s has no installer path: every result fails closed, nothing is dispatched', async (provider) => {
+      resolveEdrMock.mockClear();
+      arrange(provider, false);
+      const failWhere = vi.fn().mockResolvedValue(undefined);
+      const failSet = vi.fn().mockReturnValue({ where: failWhere });
+      updateMock.mockReturnValue({ set: failSet });
+      const result = await deploy();
+      expect(result.status).toBe('failed');
+      expect(result.message).toBe(`Unsupported integration provider: ${provider}`);
+      expect(failSet).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'failed', errorMessage: `Unsupported integration provider: ${provider}`,
+      }));
+      expect(resolveEdrMock).not.toHaveBeenCalled();
+      expect(dispatchDeviceCommandMock).not.toHaveBeenCalled();
+    });
+
+    it('a Huntress payload keeps the version file name, type and checksum, and gains no key', async () => {
+      resolveEdrMock.mockResolvedValueOnce({ downloadUrl: LINK, silentInstallArgs: '/S' });
+      selectMock
+        .mockReturnValueOnce(sel([{ ...version, fileType: 'exe', originalFileName: 'HuntressInstaller.exe' }]))
+        .mockReturnValueOnce(sel([{ id: 'cat-1', orgId: null, name: 'Huntress', integrationProvider: 'huntress' }]))
+        .mockReturnValueOnce(sel([{ id: 'dev-1', agentId: 'agent-1' }]));
+      insertMock.mockReturnValueOnce(insWithReturning([{ id: 'dep-fw', orgId: 'org-1' }])).mockReturnValueOnce(ins());
+      await deploy();
+      const payload = dispatchDeviceCommandMock.mock.calls[0]![0].payload;
+      expect(payload).toMatchObject({
+        fileName: 'HuntressInstaller.exe', fileType: 'exe', checksum: 'a'.repeat(64),
+      });
+      expect(payload).not.toHaveProperty('integrationProvider');
+    });
   });
 
   it('fails the whole EDR deployment (no dispatch) when the resolver returns an error', async () => {
@@ -2689,6 +2776,72 @@ describe('buildAndDispatchSoftwareInstalls — install scripts, zip and agent ga
     expect(updateSetCalls.find((c) => c.status === 'failed')?.errorMessage).toBe(
       'Could not resolve installer variable(s): {{var.missing}}',
     );
+  });
+
+  it('(j2) the batch message names the variable failure when it is every device\'s only reason (#10307)', async () => {
+    mockDeviceReads([winDevice('dev-new', NEW)], []);
+    const result = await run(
+      { ...baseVersion, installScriptsEnabled: true, preInstallScript: 'echo {{var.missing}}' },
+      ['dev-new'],
+    );
+    expect(result.message).toBe(
+      'All target devices failed installer variable resolution: Could not resolve installer variable(s): {{var.missing}}',
+    );
+  });
+
+  it('(j3) the batch message stays generic when devices failed variable resolution for different reasons (#10307)', async () => {
+    mockDeviceReads(
+      [
+        { ...winDevice('dev-a', NEW), customFields: { alpha: 'x' } },
+        { ...winDevice('dev-b', NEW), customFields: { beta: 'y' } },
+      ],
+      [],
+    );
+    const result = await run(
+      {
+        ...baseVersion,
+        installScriptsEnabled: true,
+        preInstallScript: 'echo {{device.customField.alpha}} {{device.customField.beta}}',
+      },
+      ['dev-a', 'dev-b'],
+    );
+    const reasons = updateSetCalls.filter((c) => c.status === 'failed').map((c) => c.errorMessage);
+    // Precondition: two devices, two DIFFERENT variable reasons.
+    expect(new Set(reasons).size).toBe(2);
+    expect(result.status).toBe('failed');
+    expect(result.message).toBe('All target devices failed installer variable resolution');
+  });
+
+  it('(j3b) a dispatch failure keeps the batch message from naming the variable reason (#10307)', async () => {
+    mockDeviceReads(
+      [
+        { ...winDevice('dev-a', NEW), customFields: {} },
+        { ...winDevice('dev-b', NEW), customFields: { alpha: 'x' } },
+      ],
+      [],
+    );
+    dispatchDeviceCommandMock.mockRejectedValueOnce(new Error('queue down'));
+    const result = await run(
+      { ...baseVersion, installScriptsEnabled: true, preInstallScript: 'echo {{device.customField.alpha}}' },
+      ['dev-a', 'dev-b'],
+    );
+    const reasons = updateSetCalls.filter((c) => c.status === 'failed').map((c) => c.errorMessage);
+    // Precondition: one variable failure and one dispatch failure.
+    expect(reasons).toEqual(
+      expect.arrayContaining(['Could not resolve installer variable(s): {{device.customField.alpha}}', 'queue down']),
+    );
+    expect(result.status).toBe('failed');
+    expect(result.message).toBe('All target devices failed installer variable resolution');
+  });
+
+  it('(j4) the batch message stays generic when a variable failure is mixed with another gate (#10307)', async () => {
+    mockDeviceReads([winDevice('dev-old', OLD), winDevice('dev-new', NEW)], []);
+    const result = await run(
+      { ...baseVersion, installScriptsEnabled: true, preInstallScript: 'echo {{var.missing}}' },
+      ['dev-old', 'dev-new'],
+    );
+    expect(result.status).toBe('failed');
+    expect(result.message).toBe('All target devices failed installer variable resolution');
   });
 
   it('(k) scripts are substituted even when downloadUrl and args contain no {{ (the template shortcut must not skip them)', async () => {

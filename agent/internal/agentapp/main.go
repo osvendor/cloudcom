@@ -25,6 +25,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/elevaccount"
 	"github.com/breeze-rmm/agent/internal/eventlog"
 	"github.com/breeze-rmm/agent/internal/heartbeat"
+	"github.com/breeze-rmm/agent/internal/helper"
 	"github.com/breeze-rmm/agent/internal/hostpolicy"
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
@@ -86,7 +87,6 @@ var (
 	serverURL        string
 	backupServerURL  string // seeded by bootstrap/enroll responses (#2288)
 	enrollmentSecret string
-	enrollSiteID     string
 	enrollDeviceRole string
 	forceEnroll      bool
 	quietEnroll      bool
@@ -323,10 +323,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is /etc/breeze/agent.yaml)")
 	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "", "Breeze server URL")
 	enrollCmd.Flags().StringVar(&enrollmentSecret, "enrollment-secret", "", "Enrollment secret (AGENT_ENROLLMENT_SECRET on the server)")
-	enrollCmd.Flags().StringVar(&enrollSiteID, "site-id", "", "Deprecated and ignored; the site comes from the enrollment key")
-	if err := enrollCmd.Flags().MarkDeprecated("site-id", siteIDDeprecationNotice); err != nil {
-		panic(err) // only fails if the flag above is not registered
-	}
+	enrollCmd.SetFlagErrorFunc(enrollFlagError)
 	enrollCmd.Flags().StringVar(&enrollDeviceRole, "device-role", "", "Device role override (e.g. workstation, server)")
 	enrollCmd.Flags().BoolVar(&forceEnroll, "force", false, "Re-enroll even if already enrolled; replaces AgentID/AuthToken on success (no-op on failure)")
 	enrollCmd.Flags().BoolVar(&quietEnroll, "quiet", false, "Suppress stdout progress output (errors still go to stderr). Intended for unattended installs.")
@@ -342,6 +339,7 @@ func init() {
 	rootCmd.AddCommand(bootstrapCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(newContainmentCommand(config.GetDataDir))
 	rootCmd.AddCommand(supportCmd)
 	rootCmd.AddCommand(uninstallNotifyCmd)
 	rootCmd.AddCommand(userHelperCmd)
@@ -1597,7 +1595,6 @@ func enrollDevice(enrollmentKey string) {
 	initEnrollLogging(cfg, quietEnroll)
 
 	enrollLog := logging.L("enroll")
-	warnIgnoredSiteID(enrollLog, enrollSiteID)
 
 	// Clear any stale enroll-last-error.txt from a previous failed
 	// attempt BEFORE any validation or early return. Every attempt
@@ -1707,6 +1704,19 @@ var promptIdentityDataDir = config.GetDataDir
 func clearPromptIdentityAfterEnrol() {
 	if err := promptidentity.Open(promptIdentityDataDir(), promptidentity.Options{}).Clear(); err != nil {
 		logging.L("enroll").Warn("could not clear the cached MSP identity after enrollment", "error", err.Error())
+	}
+}
+
+// helperBrandingBaseDir is where the per-session helper configs live (a seam
+// for tests).
+var helperBrandingBaseDir = config.ConfigDir
+
+// clearHelperBrandingBeforeEnrol drops the persisted Helper branding (OD3): a
+// new enrolment may belong to another partner or organization. Local only. A
+// failure is logged, not fatal: the next heartbeat's decision replaces it.
+func clearHelperBrandingBeforeEnrol() {
+	if err := helper.ClearBranding(helperBrandingBaseDir()); err != nil {
+		logging.L("enroll").Warn("could not clear persisted Helper branding before enrollment", "error", err.Error())
 	}
 }
 
@@ -1858,6 +1868,7 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 			DiskTotalGB:             hardwareInfo.DiskTotalGB,
 			GPUModel:                hardwareInfo.GPUModel,
 			SerialNumber:            hardwareInfo.SerialNumber,
+			ProductSKU:              hardwareInfo.ProductSKU,
 			Manufacturer:            hardwareInfo.Manufacturer,
 			Model:                   hardwareInfo.Model,
 			MotherboardManufacturer: hardwareInfo.MotherboardManufacturer,
@@ -1962,6 +1973,7 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 		}
 	}
 
+	clearHelperBrandingBeforeEnrol()
 	if err := saveEnrollmentFn(cfg, cfgFile); err != nil {
 		return enrollSaveFailure(cfg, cfgFile, err)
 	}

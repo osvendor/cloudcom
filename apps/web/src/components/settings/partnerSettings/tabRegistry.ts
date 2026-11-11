@@ -4,6 +4,7 @@ import {
   Bell,
   Blocks,
   Building2,
+  DoorOpen,
   Globe,
   Hourglass,
   KeyRound,
@@ -28,7 +29,7 @@ export type TabKey =
   | 'security' | 'callerVerification'
   | 'notifications' | 'emailTemplates' | 'sendingDomains' | 'ticketing'
   | 'aiProvider' | 'aiFeatures' | 'aiBudgets' | 'aiApprovals'
-  | 'branding' | 'loginBranding' | 'trustCenter';
+  | 'branding' | 'loginBranding' | 'trustCenter' | 'customerPortal';
 
 export type TabDef = {
   key: TabKey;
@@ -40,8 +41,6 @@ export type TabDef = {
   /** `link` tabs navigate to `href` instead of rendering a panel in the page. */
   kind: 'panel' | 'link';
   href?: string;
-  /** Values set here are enforced across all organizations (inheritance banner). */
-  enforced?: boolean;
 };
 
 export type TabGroupId = 'company' | 'devices' | 'security' | 'communications' | 'ai' | 'branding';
@@ -66,9 +65,9 @@ export const TAB_GROUPS: readonly TabGroup[] = [
     id: 'devices',
     label: 'partnerSettingsPage.groups.devices',
     tabs: [
-      { key: 'defaults', hash: 'defaults', ...copy('defaults'), icon: SlidersHorizontal, kind: 'panel', enforced: true },
-      { key: 'eventLogs', hash: 'event-logs', ...copy('eventLogs'), icon: ScrollText, kind: 'panel', enforced: true },
-      { key: 'remoteAccess', hash: 'remote-access', ...copy('remoteAccess'), icon: MonitorSmartphone, kind: 'panel', enforced: true },
+      { key: 'defaults', hash: 'defaults', ...copy('defaults'), icon: SlidersHorizontal, kind: 'panel' },
+      { key: 'eventLogs', hash: 'event-logs', ...copy('eventLogs'), icon: ScrollText, kind: 'panel' },
+      { key: 'remoteAccess', hash: 'remote-access', ...copy('remoteAccess'), icon: MonitorSmartphone, kind: 'panel' },
       { key: 'knownGuests', hash: 'known-guests', ...copy('knownGuests'), icon: Wifi, kind: 'panel' },
     ],
   },
@@ -76,7 +75,7 @@ export const TAB_GROUPS: readonly TabGroup[] = [
     id: 'security',
     label: 'partnerSettingsPage.groups.security',
     tabs: [
-      { key: 'security', hash: 'security', ...copy('security'), icon: Shield, kind: 'panel', enforced: true },
+      { key: 'security', hash: 'security', ...copy('security'), icon: Shield, kind: 'panel' },
       // Caller verification (#6354): partner baseline, saved by the header Save.
       { key: 'callerVerification', hash: 'caller-verification', ...copy('callerVerification'), icon: PhoneCall, kind: 'panel' },
     ],
@@ -85,7 +84,7 @@ export const TAB_GROUPS: readonly TabGroup[] = [
     id: 'communications',
     label: 'partnerSettingsPage.groups.communications',
     tabs: [
-      { key: 'notifications', hash: 'notifications', ...copy('notifications'), icon: Bell, kind: 'panel', enforced: true },
+      { key: 'notifications', hash: 'notifications', ...copy('notifications'), icon: Bell, kind: 'panel' },
       { key: 'emailTemplates', hash: 'email-templates', ...copy('emailTemplates'), icon: Mail, kind: 'panel' },
       { key: 'sendingDomains', hash: 'sending-domains', ...copy('sendingDomains'), icon: AtSign, kind: 'panel' },
       // Ticketing configuration lives on its own page (M0, #6233). The rail
@@ -100,9 +99,7 @@ export const TAB_GROUPS: readonly TabGroup[] = [
     tabs: [
       { key: 'aiProvider', hash: 'ai-provider', ...copy('aiProvider'), icon: KeyRound, kind: 'panel' },
       { key: 'aiFeatures', hash: 'ai-features', ...copy('aiFeatures'), icon: Activity, kind: 'panel' },
-      { key: 'aiBudgets', hash: 'ai-budgets', ...copy('aiBudgets'), icon: Wallet, kind: 'panel', enforced: true },
-      // NOT enforced: inherit-with-override (org wins when set), unlike the
-      // aiBudgets tab's partner-locks model — see aiApprovalSettings.ts.
+      { key: 'aiBudgets', hash: 'ai-budgets', ...copy('aiBudgets'), icon: Wallet, kind: 'panel' },
       { key: 'aiApprovals', hash: 'ai-approvals', ...copy('aiApprovals'), icon: Hourglass, kind: 'panel' },
     ],
   },
@@ -110,10 +107,12 @@ export const TAB_GROUPS: readonly TabGroup[] = [
     id: 'branding',
     label: 'partnerSettingsPage.groups.branding',
     tabs: [
-      { key: 'branding', hash: 'branding', ...copy('branding'), icon: Palette, kind: 'panel', enforced: true },
+      { key: 'branding', hash: 'branding', ...copy('branding'), icon: Palette, kind: 'panel' },
       { key: 'loginBranding', hash: 'login-branding', ...copy('loginBranding'), icon: LogIn, kind: 'panel' },
       // Trust Center W2 (#8770 W02g): partner-wide default for customer trust pages (own load/save, MFA).
       { key: 'trustCenter', hash: 'trust-center', ...copy('trustCenter'), icon: ShieldCheck, kind: 'panel' },
+      // Portal registration W3 (#11380): partner-wide default sign-in & registration policy (own load/save).
+      { key: 'customerPortal', hash: 'customer-portal', ...copy('customerPortal'), icon: DoorOpen, kind: 'panel' },
     ],
   },
 ];

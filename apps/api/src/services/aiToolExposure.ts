@@ -11,6 +11,13 @@
  * self-granted-authority denial; a tool can be human-only here while still
  * being tiered and chat-reachable is NOT allowed — see the registryParity
  * contract. Entries are added only with Todd's sign-off.
+ *
+ * W15 PR A (#6785): Pax8 credential save (POST /pax8/integration), connection
+ * test (POST /pax8/integration/test) and company mapping (POST /pax8/companies/map)
+ * are human-only routes with NO tool action. Do not add them to these lists:
+ * registryParity requires HUMAN_ONLY_TOOLS entries to name registered tools.
+ * Pax8 reads are reachable and PR A writes require explicit grants; the
+ * partner-scope, partner-wide and device-bound handler gates also apply.
  */
 export const HUMAN_ONLY_TOOLS: ReadonlyMap<string, string> = new Map<string, string>([
   // Empty at W01 (spec 2026-09-23 W01-D4) until the AI Operator plan approval.
@@ -60,6 +67,29 @@ export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
   // ceiling. An operator agent reads correlations (get_alert_correlations) and acts per alert through
   // manage_alerts, whose alert id is gated against that ceiling when the proposal is minted.
   'manage_alert_correlations',
+  // Full-control W17 (#6788, Decision 4): list returns target mailboxes (the search_c2c_items / query_c2c_jobs
+  // reasoning) and the writes choose whose mail is copied. No agent need is known, so the whole tool stays human.
+  'manage_c2c_configs',
+  // Full-control W18 PR B (#6789, Decision 4, agent exposure): portal settings are a customer-visible exposure and
+  // recipients a data exit by email, both under prompt injection; an agent also runs at organization scope, which the
+  // portal settings routes refuse. The whole tools stay human, reads included.
+  'manage_org_portal_settings',
+  'manage_report_recipients',
+  // Full-control W16 PR A (#6786, Decision 7, spec D4 Q4): each starts autonomous work. An agent that could call
+  // them launches runs that launch runs (the launch_specialist and workspace_launch_analysis reasoning), and both
+  // record the requesting person, which an agent principal is not. Membership also puts them in the Wisp grant
+  // ceiling floor (isNeverDelegableTool), so launch_specialist stays the Wisp door.
+  'run_patch_plan',
+  'create_operator_task',
+  // Full-control W16 PR B (#6786, Decision 7). Schedules schedule autonomous work, and assertAgentWriteAllowed refuses
+  // every automation principal anyway. manage_fleet_designs is a recorded exception to spec D4's "action-level where
+  // only some actions grant authority": only `run` is Q4, but no agent workflow needs apply or rollback, a designer agent
+  // proposing its own design's apply adds a self-review loop, and an agent has no devices:write user permissions for
+  // preview. Agents keep the W10 reads. Membership also puts manage_ai_agent_schedules on the Wisp grant ceiling
+  // floor; manage_fleet_designs is exempted there by action since #11433 (WISP_CHAT_CALLABLE_AGENT_DENIED_ACTIONS):
+  // apply, rollback and any unlisted or omitted action stay refused under every grant.
+  'manage_ai_agent_schedules',
+  'manage_fleet_designs',
   // Full-control W08 (#6778, W08-D1): every topology tool resolves its caller through
   // requireTopologySiteAccess / the template library, both of which read the caller's USER permissions
   // (getUserPermissions). An ai_agent principal's id is not a user, so each call would be refused; the
@@ -82,6 +112,14 @@ export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
   // through tool-action rules, govern the Helper's own approvals (Q4), and their reads are the elevation policy map.
   'manage_access_reviews',
   'manage_pam_rules',
+  // Full-control W12 (#6782): installs a package manager as the console admin with no uninstall path; no autonomous
+  // workflow needs it (W12 plan, agent exposure).
+  'bootstrap_homebrew',
+  // Full-control W12 (#6782, quorum QW6): custom-field values select dynamic-group members (filterEngine custom.<key>),
+  // which feed an agent's run scope through triggers.deviceGroupIds, and are substituted into installer command lines;
+  // definition edits (scriptWrite, deviceTypes, validation) decide which value writes are admitted. The manage_tags
+  // precedent, applied to the whole tool.
+  'manage_custom_fields',
   // Recipe Library spec §6.2: the model never proposes an effect buildPlan did
   // not produce and never edits plan arguments. A model that could raise an
   // operator_plan intent could author the set a human then approves in one
@@ -127,6 +165,12 @@ export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
   // tool, which the deterministic coordinator admits after the run — so a
   // specialist can never launch a specialist (depth one).
   'launch_specialist',
+  // Network-isolation W13 (#10101, spec §2): lifting a containment from a
+  // device under incident response is a human decision, approved four-eyes
+  // from a chat session; an operator agent never proposes one (the
+  // send_endpoint_message precedent above). MCP is denied separately, by name
+  // (services/networkIsolation/bypass.ts).
+  'release_containment',
 ]);
 
 /**
@@ -172,6 +216,14 @@ export const AGENT_DENIED_READ_TOOLS: ReadonlyMap<string, string> = new Map<stri
   // other agent runs, with no device axis to bound an autonomous run.
   ['list_operator_tasks', 'Operator task objectives, hand-off summaries and outcome text are free text authored by humans and other agent runs, org-wide with no device axis: a prompt-injection channel into a run that can act.'],
   ['get_operator_task', 'Task steps, events, plan renderings and hand-off text are free text authored by humans and other agent runs, org-wide with no device axis: a prompt-injection channel into a run that can act.'],
+  // Full-control W18 PR A (#6789, Decision 4, signed off 2026-11-05): identity reads have no device axis, and the
+  // summary / readiness reads require partner or system scope, which an agent (always organization scope) never has.
+  ['list_users', 'Names, emails, roles and MFA status of every Breeze login in the tenant, with no device axis to bound an autonomous run.'],
+  ['get_user', 'One Breeze login\'s identity, role and organization or site access: personal data with no device axis.'],
+  ['list_portal_users', 'Names and emails of a customer\'s portal logins: personal data with no device axis.'],
+  ['list_roles', 'The permission matrix and who holds each role; an autonomous run has no operational need for it.'],
+  ['get_org_summary', 'Requires partner or system scope; an agent always runs at organization scope, so a catalog row could never execute.'],
+  ['get_account_readiness', 'Requires partner or system scope; an agent always runs at organization scope, so a catalog row could never execute.'],
 ]);
 
 /**
@@ -185,15 +237,37 @@ export const AGENT_DENIED_READ_TOOLS: ReadonlyMap<string, string> = new Map<stri
  * either. Entries are added only with Todd's sign-off.
  */
 export const AGENT_HUMAN_ONLY_ACTIONS: ReadonlyMap<string, string> = new Map<string, string>([
-  // Full-control W04 (#6758, W04-D8 — the W02 Task 16 follow-up): the group
-  // analogue of manage_tags. Membership is a live read at run admission and
-  // before tool use (runResourceScope.ts), so these are the same self-scope path.
-  ['manage_groups:add_devices', 'Group membership feeds agent run scope (triggers.deviceGroupIds, a live read in runResourceScope.ts): an allowlisted tier-2 add would let an agent put devices inside its own or another agent\'s future reach unattended.'],
-  ['manage_groups:remove_devices', 'Removing a device from a group changes which group-scoped agents, config-policy assignments and peripheral policies reach it; the same run-scope path as manage_tags:remove.'],
+  // manage_groups add_devices/remove_devices were here (W04-D8, #6758) until
+  // #10149 (QW9) made them supervised with org/site scope guards: an agent's
+  // allowlisted call is now a tier-3 proposal a person approves, never an
+  // unattended membership write, and neither is in ACT_MANIFEST.
   ['manage_tags:add', 'Device tags feed the agent\'s own run scope (triggers.deviceTags, runResourceScope.ts) and dynamic-group membership (triggers.deviceGroupIds): an allowlisted tier-2 add would let an agent widen its future reach unattended.'],
   ['manage_tags:remove', 'Removing a tag can ADMIT a device to a dynamic group whose rule is negative (isEmpty / notContains, filterEngine.ts); membership is re-evaluated on every tag change and feeds the agent\'s run scope through triggers.deviceGroupIds.'],
   // Full-control W11 (#6781, W11-D8, quorum QW5/QW9): both write auth.user.id into a users FK, and a user-owned
   // release would run them as the approving human, dropping the requesting run's site ceiling.
   ['manage_audit_baselines:create', 'An active audit baseline replaces the org\'s active one and enrols every device of that OS in the daily audit-policy collection; a user-owned release would run it as the approving human and lose the run\'s site ceiling.'],
+  // Full-control W12 (#6782, W12 plan agent exposure).
+  ['manage_device_software:uninstall', 'Removing an application from a customer machine is irreversible (no undo, no dry run); a person decides it.'],
+  // Full-control W13 (#6783, W13 plan agent exposure; the W02-D2 manage_tags precedent).
+  ['manage_device_function:set', 'A device function is an allowed execution-targeting filter: it selects dynamic-group members, which feed an agent run\'s own scope (triggers.deviceGroupIds), so a run must not set it.'],
+  // Full-control W13 PR B (#6783): an agent that can run scripts must not also edit the values those scripts receive.
+  ['manage_tenant_variables:create', 'Tenant-variable values are substituted into every script dispatched to the org\'s devices; an agent that runs scripts must not also choose their inputs.'],
+  ['manage_tenant_variables:update', 'Tenant-variable values are substituted into every script dispatched to the org\'s devices; an agent that runs scripts must not also choose their inputs.'],
+  ['manage_tenant_variables:delete', 'Deleting a tenant variable changes what every script referencing it receives on the org\'s devices; a person decides it.'],
+  // Full-control W14 (#6784, W14 plan agent exposure): the legal documents customers sign, and their executed records.
+  ['manage_contract_templates:create', 'Agreement templates are the legal documents customers sign; a person authors them (the human_only_legal_evidence reasoning).'],
+  ['manage_contract_templates:update', 'Agreement templates are the legal documents customers sign; a person authors them (the human_only_legal_evidence reasoning).'],
+  ['manage_contract_templates:create_version', 'Agreement templates are the legal documents customers sign; a person authors them (the human_only_legal_evidence reasoning).'],
+  ['manage_contract_templates:publish', 'Agreement templates are the legal documents customers sign; a person authors them (the human_only_legal_evidence reasoning).'],
+  ['manage_contract_templates:archive', 'Agreement templates are the legal documents customers sign; a person authors them (the human_only_legal_evidence reasoning).'],
+  ['manage_contract_documents:link', 'Filing a signed agreement under a contract is an irreversible change to an executed legal record; a person decides it.'],
+  // Full-control W14 PR B (#6784, W14 plan agent exposure): money and data that leave the tenant.
+  ['manage_pax8_orders:submit', 'A real billable Pax8 order has no idempotency key and cancellation is terminal; a person asks and two people approve.'],
+  ['manage_contracts:generate_invoice', 'Generating a contract invoice bills the customer and may issue and email it; a person asks for it and two people approve it.'],
+  ['manage_accounting_sync:push', 'Pushing an invoice writes it into the partner\'s accounting books outside Breeze; a person asks for it and two people approve it.'],
+  ['manage_accounting_sync:push_bulk', 'Pushing invoices writes them into the partner\'s accounting books outside Breeze; a person asks for it and two people approve it.'],
+  ['manage_accounting_sync:link_mapping', 'Linking a mapping overwrites the accounting provider\'s customer or item with Breeze\'s values; a person decides it.'],
+  ['manage_accounting_sync:unlink_mapping', 'Accounting mappings decide which books record each customer and item; a person decides them.'],
+  ['manage_accounting_sync:sync_mapping', 'A sync overwrites the accounting provider\'s customer or item with Breeze\'s values; a person decides it.'],
   ['manage_audit_baselines:request_apply', 'An apply request is the input to a second person\'s approval that pushes audit policy to up to 500 devices; its requester must be a person, who then cannot approve it.'],
 ]);

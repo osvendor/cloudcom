@@ -104,6 +104,8 @@ vi.mock('./aiGuardrails', () => ({
 vi.mock('./scriptProposals', () => ({
   attachProposalToSession: vi.fn(async () => undefined),
   loadProposalGuardrailContext: vi.fn(async () => undefined),
+  loadProposalGuardrailContextInReach: vi.fn(async () => ({ context: undefined, proposalOrgId: null })),
+  resolveProposalOrgInReach: vi.fn(async () => null),
 }));
 vi.mock('./auditEvents', () => ({
   writeAuditEvent: vi.fn(),
@@ -113,6 +115,9 @@ vi.mock('./clientIp', async (orig) => ({
   ...(await orig<typeof import('./clientIp')>()),
   getTrustedClientIpOrUndefined: () => undefined,
 }));
+
+// Not reached here (the custom mcpServerFactory skips flow resolution); mocked for the flowToolsMock contract (#11011).
+vi.mock('./flows/flowTools', () => ({ resolveFlowTools: async () => [] }));
 
 import { StreamingSessionManager, type ActiveSession } from './streamingSessionManager';
 import type { createSessionPostToolUse } from './aiAgentSdk';

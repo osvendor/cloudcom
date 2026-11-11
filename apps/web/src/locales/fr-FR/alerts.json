@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}} % confiance"
   },
   "alertDetailPage": {
+    "externalTickets": "Tickets externes",
+    "externalTicketsFailedToLoad": "Impossible de charger les tickets externes.",
     "loadingAlert": "Alerte chargement...",
     "backToAlerts": "Retour aux alertes",
     "goBack": "Retourne",
@@ -82,6 +84,21 @@
       "resolved": "Résolu",
       "suppressed": "Masqué",
       "dismissed": "Ignoré"
+    },
+    "createPsaTicket": "Créer un ticket PSA",
+    "psaTicketRequested": "Ticket PSA demandé",
+    "failedToCreatePsaTicket": "Impossible de demander le ticket PSA",
+    "lifecycleLine": {
+      "text": "{{rearm}} · temps de récupération {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Se réarme sur de nouvelles preuves",
+      "rearmAfterDelay": "Se réarme après {{minutes}} min",
+      "sources": {
+        "monitor": "ce moniteur",
+        "org": "valeur par défaut de l'organisation",
+        "partner": "valeur par défaut du partenaire",
+        "builtin": "valeur par défaut intégrée",
+        "legacy": "règle d'alerte"
+      }
     }
   },
   "alertDetails": {
@@ -652,6 +669,7 @@
       "info": "Information"
     },
     "status": {
+      "open": "Ouvert",
       "active": "Actif",
       "acknowledged": "Acquitté",
       "resolved": "Résolu",
@@ -965,5 +983,10 @@
       "body": "Les modèles existants restent modifiables ici et seront convertis dans la prochaine version.",
       "link": "Ouvrir les moniteurs"
     }
+  },
+  "subject": {
+    "label": "Sujet",
+    "backupWorkload": "Charge de sauvegarde",
+    "topologySite": "Site de topologie"
   }
 }

@@ -42,6 +42,8 @@ const { dbMock, resultsQueue, captureExceptionMock, resolveMonitorsForDeviceMock
   };
 });
 
+vi.mock('./alertLifecycle/resolve', async (importOriginal) =>
+  (await import('../testUtils/alertLifecycleMock')).legacyLifecycleModule(await importOriginal()));
 vi.mock('drizzle-orm', () => ({
   eq: (col: unknown, val: unknown) => ({ op: 'eq', col, val }),
   and: (...args: unknown[]) => ({ op: 'and', args }),
@@ -57,7 +59,7 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({ db: dbMock, withSystemDbAccessContext: (fn: () => unknown) => fn() }));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id' },

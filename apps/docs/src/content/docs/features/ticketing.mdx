@@ -99,6 +99,28 @@ If the two organizations bill in different currencies and the ticket still has *
   Tickets can only be moved between organizations of the **same partner**. This is a high-privilege action: it requires ticket and organization edit permissions plus MFA confirmation, and isn't available to site-restricted technicians.
 </Aside>
 
+### Merging duplicate tickets
+
+When the same issue arrives twice (a customer emails and also calls, or two people report one outage), merge the duplicate into the ticket you want to keep.
+
+1. Open the duplicate and choose **Merge into…** in the ticket header.
+2. Pick the ticket to keep. The list shows the organization's open tickets, oldest first, and you can search it. Resolved and closed tickets cannot receive a merge.
+3. Read the preview. It lists what moves to the kept ticket (comments, attachments, time entries, parts, checklist items, linked alerts and emails, tags), the links that are dropped, and whether the kept ticket keeps its own device or takes the duplicate's. When the ticket you picked is not the older one, the preview suggests the older one, which is usually the one to keep.
+4. Decide whether to email the duplicate's requester. **Notify the requester** is ticked by default when the two tickets have different requesters.
+5. Click **Merge** and confirm with MFA.
+
+After the merge:
+
+- The duplicate becomes a **closed, read-only record** with a banner linking to the kept ticket. Nothing can be added to it or changed on it. Comments that moved show "from T-…" next to the author.
+- The kept ticket keeps its own SLA clock, priority and assignee. Time entries and parts move with their amounts and billing state unchanged.
+- **Replies follow the merge.** Email sent to the duplicate's thread is added to the kept ticket.
+- **In the customer portal**, the duplicate shows a "This request was merged into T-…" banner. Its requester can read and reply on the kept ticket.
+- Merged tickets are hidden from the queue. Tick **Show merged** above the list to see them.
+
+A merge cannot be undone. It is refused when the tickets belong to different organizations (move one first), when either ticket has a customer approval request or a budget, when either is tied to a service deliverable or an open migration import, when one is planned work and the other a support ticket, or when the duplicate has AI actions waiting for approval. The preview names the reason before you confirm.
+
+Merging needs ticket edit permission and access to both tickets' sites and devices. The AI assistant can preview and perform a merge through its ticket tool, under the same rules and with approval.
+
 ### Deleting and Restoring Tickets
 
 Click **Delete**, next to **Move to another org…** in the ticket header, to remove a ticket. A confirm dialog explains that the ticket is hidden from every queue and can be restored by an admin, then deletes it. The same **Delete** action is available from the bulk action bar for a batch of selected tickets.
@@ -278,7 +300,7 @@ Edit the acknowledgement under **Settings → Partner → Email templates** (Tic
 
 ### Review queue
 
-Emails that Breeze can't automatically turn into a ticket land in a **review queue** instead -- so unsolicited or unprocessable mail doesn't flood the ticket queue. From there you can convert a message into a ticket (assigning it to the right organization) or dismiss it. Two kinds of mail land here:
+Emails that Breeze can't automatically turn into a ticket land in a **review queue** instead -- so unsolicited or unprocessable mail doesn't flood the ticket queue. From there you can convert a message into a ticket (assigning it to the right organization) or dismiss it. Working the queue needs the `tickets:email_review` permission (full admins already have it), so you can give a triage role or service account access to the queue without making it a full admin. The permission alone is enough to read the queue and to convert a message into a ticket in any of the partner's organizations, so grant it deliberately. Two kinds of mail land here:
 
 - Any email that **failed to process** -- for example, one with no usable sender address.
 - Emails from **unknown senders**, if your **Unknown senders** setting is left on its default. See [Unknown sender handling](#unknown-sender-handling) below to change that behavior.
@@ -289,7 +311,7 @@ Emails that Breeze can't automatically turn into a ticket land in a **review que
 
 ### Unknown sender handling
 
-A sender is "unknown" when it isn't a portal user, a mapped customer domain, or a reply to an existing ticket. Choose what happens to that mail under **Settings → Ticketing → Inbound email**, in the **Unknown senders** section:
+A sender is "unknown" when it isn't a portal user, a mapped customer domain, or a reply to an existing ticket. Customer domains are managed under **Settings → Organizations → [organization] → Domains**; **Settings → Ticketing → Inbound email** shows a read-only summary of them (see [Customer domain verification](/features/portal-domain-verification/)). Choose what happens to that mail under **Settings → Ticketing → Inbound email**, in the **Unknown senders** section:
 
 | Option | Behavior |
 |---|---|
@@ -358,7 +380,7 @@ Instead of forwarding to your Breeze inbound address, you can connect a Microsof
 
 </Steps>
 
-Once connected, Breeze polls the mailbox every minute or two, turns new messages into tickets (threading and the review queue work exactly as above), and marks each handled message as read so your team can see what's been picked up. Only mail that arrives after you connect is ticketed -- existing inbox history is not imported. Public replies go out **from the support address** and thread natively in the customer's mailbox; internal notes and technician notifications are unaffected. You can connect more than one mailbox (for example `support@` and `billing@`). **Disconnect** stops polling immediately; to fully remove access, also revoke the app's consent in your Microsoft Entra admin center.
+Once connected, Breeze polls the mailbox every minute or two, turns new messages into tickets (threading and the review queue work exactly as above), and marks each handled message as read so your team can see what's been picked up. Only mail that arrives after you connect is ticketed -- existing inbox history is not imported, and Breeze neither marks it read nor sends it an autoresponse. The first poll reads through the inbox to set its starting point, which can take several minutes on a large mailbox; the card then shows how many messages, if any, were already there and will not be imported. Older mail that someone later reads, flags or moves back into the inbox stays out too. Reconnecting a mailbox that lost its consent picks up the mail that arrived while it was down, but connecting one again after you **Disconnect** it starts over from that moment, so mail received in between is not ticketed. Public replies go out **from the support address** and thread natively in the customer's mailbox; internal notes and technician notifications are unaffected. You can connect more than one mailbox (for example `support@` and `billing@`). **Disconnect** stops polling immediately; to fully remove access, also revoke the app's consent in your Microsoft Entra admin center.
 
 A temporary Microsoft Graph problem -- throttling, a Microsoft server error, a network failure or a request that times out -- does not stop the mailbox: it stays **Connected** and Breeze retries on the next poll. Only an authorization failure asks you to reconnect.
 
@@ -371,6 +393,19 @@ If a connection does not complete:
 
 <Aside>
   Connecting or managing a mailbox requires **partner scope and MFA**. The Microsoft 365 mailbox card only appears once your operator has configured the Breeze Ticketing Azure app -- see [Ticket Mailbox environment variables](/deploy/environment/#ticket-mailbox-m365-email-to-ticket).
+</Aside>
+
+#### How external mail is verified on a connected mailbox
+
+Unverified external mail goes to the review queue (or is dropped, if you turned that on), so a forged From address from outside your tenant can't open a ticket under your customer's name. On a Microsoft 365 mailbox Breeze verifies external mail with:
+
+- **Exchange Online's own check.** Mail counts as verified when Exchange marks it as external mail not attributed to a connector, it carries exactly one `Authentication-Results` header with Exchange's authserv-id (`mx.microsoft.com` or a `*.mail.protection.outlook.com` host), and that header says `dmarc=pass` for the From domain. Mail from a domain with no DMARC record (`dmarc=none`) stays in review. A second `Authentication-Results` header also sends a message to review, since Breeze can't tell which one Exchange wrote. Mail Exchange attributes to a partner connector isn't verified from this header.
+- **A trusted mail gateway, if you list one.** With an inline gateway that adds an ARC seal, Exchange checks the gateway instead of the sender and may fail legitimate mail. Under **Mail gateway** on the mailbox, list the gateway's ARC sealing domain: the `d=` value in the gateway's `ARC-Seal` header on a message it delivered (not `microsoft.com`, which is Exchange's own seal). Breeze then verifies the seal and the gateway's signature over the From header, and uses the gateway's verdict, which must be for the From domain. A seal more than 6 hours older than the message's arrival isn't used. The list is empty by default. If the gateway's key can't be fetched, Breeze retries for up to an hour before the message goes to review. A gateway that doesn't add an ARC seal isn't used; Breeze falls back to Exchange's own check, and never reads `Authentication-Results-Original`, because a sender can write that header.
+
+The review queue shows which of these Breeze checked and why the message didn't pass, for example `unverified sender (SPF/DKIM/DMARC): Exchange Online stamp: dmarc=fail`.
+
+<Aside type="caution">
+  Only list a gateway that all of the tenant's inbound mail is forced through: first restrict inbound delivery in Exchange to the gateway with a connector. Without that restriction, Breeze can't tell a message the gateway delivered from one sent directly to Exchange.
 </Aside>
 
 ### Connecting a Google Workspace support mailbox

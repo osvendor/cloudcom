@@ -8,7 +8,9 @@
  *
  * Mocked, and only these: the BullMQ producer of the flow-runs queue (each
  * slice is driven by calling `processFlowRunJob` with a fake job), the agent
- * socket send (`sendCommandToAgent` ⇒ delivered) and the device result wait
+ * socket (`isAgentConnected` ⇒ a local socket, `sendCommandToAgent` ⇒
+ * delivered; command dispatch goes local-first through the relay facade,
+ * #4142) and the device result wait
  * (`waitForCommandResult` ⇒ a completed result). Everything that writes a
  * row — the device_commands / script_executions dispatch included — is real.
  *
@@ -33,7 +35,7 @@ vi.mock('../../jobs/flowRunQueue', async (importOriginal) => {
 });
 vi.mock('../../routes/agentWs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../routes/agentWs')>();
-  return { ...actual, sendCommandToAgent: h.sendCommandToAgent };
+  return { ...actual, isAgentConnected: vi.fn(() => true), sendCommandToAgent: h.sendCommandToAgent };
 });
 vi.mock('../../services/commandQueue', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/commandQueue')>();
@@ -539,8 +541,11 @@ describe('event trigger through the real event-dispatch queue (enforce mode)', (
     });
     const causing = await seedEnabledFlowRun({ orgId: org.id, partnerId: partner.id, delegatorUserId: delegator.id, stepId: 'look', tool: 'list_devices', pin });
 
+    const site = await createSite({ orgId: org.id });
+    if (!site) throw new Error('Missing event device site');
+    const device = await createDevice({ orgId: org.id, siteId: site.id });
     const eventId = await withFlowExecutionContext({ runId: causing.runId, chainDepth: 1 }, () =>
-      publishEvent('alert.resolved', org.id, { alertId: randomUUID() }, 'flow-it'));
+      publishEvent('alert.resolved', org.id, { alertId: randomUUID(), deviceId: device.id }, 'flow-it'));
 
     const q = getEventDispatchQueue();
     const routeJob = await q.getJob(`event-route-${eventId}`);

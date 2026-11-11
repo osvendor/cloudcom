@@ -8,6 +8,7 @@ import { stripBase, withBase } from '../lib/basePath';
 import { buildDocAccentCss } from '../lib/docAccent';
 import { isPortalChromeAccent, PORTAL_CHROME_ACCENT_DEFAULT } from '@breeze/shared';
 import { buildPortalCustomCss } from '../lib/customCss';
+import { landingWelcomeMessage } from '../lib/welcomeMessage';
 
 interface Props {
   title: string;
@@ -53,6 +54,7 @@ if (!remoteOnly && branding.enableTickets !== false) {
   }
 }
 const navItems = remoteOnly ? [] : buildPortalNavItems(branding, paymentMethods.statusCode === 200, approvalsPendingCount);
+const welcomeMessage = landingWelcomeMessage(branding, pathname);
 
 const accentCss = buildDocAccentCss(docAccent ?? branding.primaryColor);
 // Org-authored portal styling (#5940) — saved via the branding editor and
@@ -283,6 +285,13 @@ const isActive = (href: string) => {
               sheet && 'rounded-lg border border-border/70 bg-card px-4 py-6 sm:px-9 sm:py-8',
             ]}
           >
+            {/* Plain text the MSP typed: an escaped text node, line breaks kept
+                by pre-line. Never set:html (lib/welcomeMessage.ts). */}
+            {welcomeMessage && (
+              <p data-testid="portal-welcome" class="mb-6 whitespace-pre-line break-words border-b border-border/70 pb-5 text-sm leading-relaxed text-foreground/80">
+                {welcomeMessage}
+              </p>
+            )}
             <slot />
 
             {/* A ledger page has a foot. Partner footer text when the firm

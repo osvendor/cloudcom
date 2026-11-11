@@ -413,10 +413,20 @@ const ROUTE_LEVEL_BODY_LIMITS: Record<
     globalMaxSize: 1 * MB,
     note: 'tighter than the gate — 8 KiB device-unable report (#9517), enforced on bytes read so a chunked body is capped too.',
   },
+  'agents/elevationWithdraw.ts': {
+    paths: ['/api/v1/agents/agent-1/elevation-requests/10000000-0000-4000-8000-000000000009/withdraw'],
+    globalMaxSize: 1 * MB,
+    note: 'tighter than the gate — 4 KiB withdraw body (#8971).',
+  },
   'agents/hardwareHealth.ts': {
     paths: ['/api/v1/agents/agent-1/hardware-health'],
     globalMaxSize: 2 * MB,
     note: 'carved out — 2MB hardware/RAID snapshot ingest (#6856); route and gate agree at 2MB.',
+  },
+  'agents/oemUpdates.ts': {
+    paths: ['/api/v1/agents/agent-1/oem-updates/verification'],
+    globalMaxSize: 1 * MB,
+    note: 'tighter than the gate — 4 KiB vendor update verification report (#11065).',
   },
   'agents/timeStatus.ts': {
     paths: ['/api/v1/agents/agent-1/time-status'],
@@ -444,6 +454,36 @@ const ROUTE_LEVEL_BODY_LIMITS: Record<
     paths: ['/api/v1/wisp/thread/11111111-1111-4111-8111-111111111111/attachments'],
     globalMaxSize: 6 * MB,
     note: 'carved out — Wisp thread attachment (5 MiB text + 1 MiB envelope/JSON escaping); route and gate agree at 6MB.',
+  },
+  'agents/nativeTarget.ts': {
+    paths: ['/api/v1/agents/agent-1/native-target/enroll'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (2048 bytes) is tighter than the global default; no carve-out.',
+  },
+  'nativeTarget.ts': {
+    paths: ['/api/v1/native-target/authorize'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (2048 bytes) is tighter than the global default; no carve-out.',
+  },
+  'portal/nativeAdmission.ts': {
+    paths: ['/api/v1/portal/remote/native/sessions'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (2048 bytes) is tighter than the global default; no carve-out.',
+  },
+  'portal/nativeLogin.ts': {
+    paths: ['/api/v1/portal/auth/native/exchange', '/api/v1/portal/remote/native/authorize'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (2048 bytes) is tighter than the global default; no carve-out.',
+  },
+  'portal/remote.ts': {
+    paths: ['/api/v1/portal/remote/device-1'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (70000 bytes) is tighter than the global default; no carve-out.',
+  },
+  'staffNative.ts': {
+    paths: ['/api/v1/staff-native/authorize'],
+    globalMaxSize: 1 * MB,
+    note: 'Native remote route limit (2048 bytes) is tighter than the global default; no carve-out.',
   },
   'agents/processSample.ts': {
     paths: ['/api/v1/agents/agent-1/process-sample'],

@@ -158,7 +158,7 @@ vi.mock('drizzle-orm', () => ({
 // Import under test (after mocks)
 // ---------------------------------------------------------------------------
 
-import { buildApproverAuthContextForIntent, buildAuthContextForIntent, originPrincipalFor, releaseCarriesSessionEpochs } from './actorContext';
+import { buildApproverAuthContextForIntent, buildAuthContextForIntent, originPrincipalFor, PARTNER_AXIS_RELEASE_ACTIONS, releaseCarriesSessionEpochs } from './actorContext';
 import { IntentScopeLostError } from './intentTargetScope';
 import type { ActionIntent } from '../../db/schema/actionIntents';
 
@@ -1070,6 +1070,28 @@ describe('buildApproverAuthContextForIntent (#4177, W04)', () => {
     expect(permState.getUserPermissions).toHaveBeenCalledWith('approver-1', { partnerId: 'partner-1', orgId: 'org-1' });
   });
 
+  // Full-control W14 PR B (#6784, PR B quorum QB6): the partner-wide gate (canManagePartnerWidePolicies) reads
+  // partnerOrgAccess; a released partner-axis context must carry the CURRENT membership's value.
+  it.each(['all', 'selected'] as const)('carries the live partner membership orgAccess (%s) as partnerOrgAccess', async (orgAccess) => {
+    dbState.selectUsersResults.push([approver]);
+    permState.getUserPermissions.mockResolvedValueOnce({
+      permissions: [], partnerId: 'partner-1', orgId: null, roleId: 'role-1', scope: 'partner', orgAccess,
+      ...(orgAccess === 'selected' ? { allowedOrgIds: ['org-1'] } : {}),
+    });
+    const result = await buildApproverAuthContextForIntent(agentIntent(), 'approver-1');
+    expect(result!.partnerOrgAccess).toBe(orgAccess);
+  });
+
+  it('an org-scoped user-owned release carries no partnerOrgAccess, even for an orgAccess:all partner member', async () => {
+    dbState.selectUsersResults.push([activeUser]);
+    permState.getUserPermissions.mockResolvedValueOnce({
+      permissions: [], partnerId: 'partner-1', orgId: 'org-1', roleId: 'role-1', scope: 'partner', orgAccess: 'all',
+    });
+    const result = await buildAuthContextForIntent(baseIntent({ partnerId: 'partner-1', originPrincipalKind: 'user_session' } as Partial<ActionIntent>));
+    expect(result!.scope).toBe('organization');
+    expect(result!.partnerOrgAccess ?? null).toBeNull();
+  });
+
   it('returns null for an org-axis approver — never widens an org member to partner scope', async () => {
     dbState.selectUsersResults.push([approver]);
     permState.getUserPermissions.mockResolvedValueOnce({
@@ -1213,5 +1235,109 @@ describe('buildAuthContextForIntent — apply_topology_template session epochs (
     expect(releaseCarriesSessionEpochs({ actionName: 'apply_topology_template', arguments: { action: 'apply' } }, { kind: 'user_session' })).toBe(true);
     expect(releaseCarriesSessionEpochs({ actionName: 'apply_topology_template', arguments: { action: 'apply' } }, { kind: 'api_key' } as never)).toBe(false);
     expect(releaseCarriesSessionEpochs({ actionName: 'run_script', arguments: { action: 'apply' } }, { kind: 'user_session' })).toBe(false);
+  });
+});
+
+describe('buildAuthContextForIntent — named partner-axis release (W16 Decision 8, #11135)', () => {
+  const scheduleIntent = (overrides: Partial<ActionIntent> = {}) => baseIntent({
+    actionName: 'manage_ai_agent_schedules',
+    arguments: { action: 'create', ownerScope: 'partner' },
+    originPrincipalKind: 'user_session',
+    partnerId: 'partner-1',
+    ...overrides,
+  } as never);
+  const partnerPerms = { scope: 'partner', partnerId: 'partner-1', orgId: null, roleId: 'role-1', orgAccess: 'all' };
+  const orgPerms = { scope: 'organization', partnerId: null, orgId: 'org-1', roleId: 'role-1' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbState.selectUsersResults.length = 0;
+    dbState.selectUsersResults.push([activeUser]);
+  });
+
+  it.each([
+    ['manage_ai_agent_schedules', 'create'],
+    ['manage_ai_agent_schedules', 'update'],
+    ['manage_ai_agent_schedules', 'delete'],
+    ['manage_org_portal_settings', 'set_sensitive_access'],
+  ])('a full-partner requester releases %s:%s on the partner axis with live partnerOrgAccess', async (actionName, action) => {
+    permState.getUserPermissions.mockResolvedValueOnce(partnerPerms);
+    const result = await buildAuthContextForIntent(scheduleIntent({ actionName, arguments: { action } } as never));
+    expect(result?.scope).toBe('partner');
+    expect(result?.token).toMatchObject({ scope: 'partner', partnerId: 'partner-1' });
+    expect(result?.partnerId).toBe('partner-1');
+    expect(result?.partnerOrgAccess).toBe('all');
+    expect(result?.accessibleOrgIds).toEqual(['org-1']);
+  });
+
+  it("carries the membership's CURRENT access, so a member narrowed to selected fails the partner-wide gate", async () => {
+    permState.getUserPermissions.mockResolvedValueOnce({ ...partnerPerms, orgAccess: 'selected', allowedOrgIds: ['org-1'] });
+    const result = await buildAuthContextForIntent(scheduleIntent());
+    expect(result?.scope).toBe('partner');
+    expect(result?.partnerOrgAccess).toBe('selected');
+  });
+
+  it('an org-axis requester keeps organization scope and no partner authority', async () => {
+    permState.getUserPermissions.mockResolvedValueOnce(orgPerms);
+    const result = await buildAuthContextForIntent(scheduleIntent());
+    expect(result?.scope).toBe('organization');
+    expect(result?.partnerOrgAccess).toBeNull();
+  });
+
+  it('a requester of another partner never takes the partner axis', async () => {
+    permState.getUserPermissions.mockResolvedValueOnce({ ...partnerPerms, partnerId: 'partner-2' });
+    const result = await buildAuthContextForIntent(scheduleIntent());
+    expect(result, 'the context is built (a null here would make this test vacuous)').not.toBeNull();
+    expect(result?.scope).toBe('organization');
+    expect(result?.partnerOrgAccess).toBeNull();
+  });
+
+  it('an intent with no partner id never takes the partner axis', async () => {
+    permState.getUserPermissions.mockResolvedValueOnce(partnerPerms);
+    const result = await buildAuthContextForIntent(scheduleIntent({ partnerId: null }));
+    expect(result, 'the context is built (a null here would make this test vacuous)').not.toBeNull();
+    expect(result?.scope).toBe('organization');
+  });
+
+  it.each([
+    ['a read action of a listed tool', { arguments: { action: 'list' } }],
+    ['an unlisted action of a listed tool', { actionName: 'manage_org_portal_settings', arguments: { action: 'update' } }],
+    ['an unlisted tool', { actionName: 'run_script', arguments: { action: 'create' } }],
+    ['no action at all', { arguments: {} }],
+  ])('%s keeps the exact organization-axis context', async (_label, overrides) => {
+    permState.getUserPermissions.mockResolvedValueOnce(partnerPerms);
+    const result = await buildAuthContextForIntent(scheduleIntent(overrides as never));
+    expect(result, 'the context is built (a null here would make this test vacuous)').not.toBeNull();
+    expect(result?.scope).toBe('organization');
+    expect(result?.partnerOrgAccess).toBeNull();
+    const token = result!.token as unknown as Record<string, unknown>;
+    expect(token.scope).toBe('organization');
+    expect(token.aep).toBeUndefined();
+    expect(token.mep).toBeUndefined();
+  });
+
+  it.each(['client_user', 'unknown', 'helper', 'agent'])('a recorded %s origin never takes the axis', async (originPrincipalKind) => {
+    permState.getUserPermissions.mockResolvedValueOnce(partnerPerms);
+    const result = await buildAuthContextForIntent(scheduleIntent({ originPrincipalKind } as never));
+    expect(result, 'the context is built (a null here would make this test vacuous)').not.toBeNull();
+    expect(result?.scope).toBe('organization');
+    expect(result?.partnerOrgAccess).toBeNull();
+  });
+
+  it('carries no session epochs', async () => {
+    permState.getUserPermissions.mockResolvedValueOnce(partnerPerms);
+    dbState.selectUsersResults.length = 0;
+    dbState.selectUsersResults.push([{ ...activeUser, authEpoch: 7, mfaEpoch: 3 }]);
+    const result = await buildAuthContextForIntent(scheduleIntent());
+    const token = result!.token as unknown as Record<string, unknown>;
+    expect(token.aep).toBeUndefined();
+    expect(token.mep).toBeUndefined();
+  });
+
+  it('the registry names exactly these actions', () => {
+    expect([...PARTNER_AXIS_RELEASE_ACTIONS.entries()]).toEqual([
+      ['manage_ai_agent_schedules', ['create', 'update', 'delete']],
+      ['manage_org_portal_settings', ['set_sensitive_access']],
+    ]);
   });
 });

@@ -21,8 +21,12 @@ const REVISION_ID = '00000000-0000-4000-8000-0000000000e2';
 const GRANTOR = '00000000-0000-4000-8000-0000000000e3';
 const THREAD_ID = '00000000-0000-4000-8000-0000000000e4';
 
+type ExtraTool = { name: string; handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> };
+
 interface Hooks {
   getAuth?: () => unknown;
+  /** The outcome tools the run registered (createBreezeMcpServer's `extraTools`). */
+  extraTools?: ExtraTool[];
   pre?: (tool: string, input: Record<string, unknown>) => Promise<{ allowed: boolean; error?: string }>;
   post?: (
     tool: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number,
@@ -186,6 +190,14 @@ vi.mock('../wisp/grantAuthority', async (importOriginal) => ({
 const dispatchSpecialistRequests = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock('../wisp/specialistDispatch', () => ({ dispatchSpecialistRequests }));
 
+// #10402 — the first-look post (its own rules: firstLook.test.ts + wispFirstLook.integration.test.ts).
+const postFirstLookIfDone = vi.hoisted(() => vi.fn<(grantId: string) => Promise<unknown>>(async () => ({ posted: false, reason: 'in_progress' })));
+vi.mock('../wisp/firstLook', () => ({ postFirstLookIfDone }));
+
+// W07 (#11496) — a run check-in's result post (its own rules: wispCheckInRuns.integration.test.ts).
+const postCheckInRunResult = vi.hoisted(() => vi.fn<(runId: string) => Promise<unknown>>(async () => 'posted'));
+vi.mock('../wisp/checkInRuns', () => ({ postCheckInRunResult }));
+
 import { executeAgentRun, resolveRunProfileLimits, resolveRunProfileToolAllowlist } from './runLoop';
 import { assessmentToolAllowlist } from './assessmentProfile';
 import { makeResolvedModel } from '../aiModels/__fixtures__/resolvedModel';
@@ -218,7 +230,7 @@ function snapshot(effective: AiAgentPolicy): AiAgentPolicySnapshot {
   };
 }
 
-function seedRows(run: { profile: 'assessment' | 'triage'; grant: boolean }) {
+function seedRows(run: { profile: 'assessment' | 'triage'; grant: boolean; reason?: Record<string, unknown> }) {
   const effective = policy();
   dbMockState.rowQueues.ai_agent_runs = [[{
     id: RUN_ID, agentId: AGENT_ID, orgId: ORG_ID, deviceId: null, alertId: null,
@@ -226,7 +238,7 @@ function seedRows(run: { profile: 'assessment' | 'triage'; grant: boolean }) {
     anomalyIncidentId: null, status: 'queued', modeAtStart: 'shadow',
     triggerKind: run.profile === 'triage' ? 'ticket' : 'schedule',
     policySnapshot: snapshot(effective), profile: run.profile, correlationGroupId: null, scheduleId: null,
-    triggerRef: run.grant ? { wisp: { grantId: GRANT_ID, grantRevisionId: REVISION_ID, reason: { kind: 'tick' }, watermark: null } } : {},
+    triggerRef: run.grant ? { wisp: { grantId: GRANT_ID, grantRevisionId: REVISION_ID, reason: run.reason ?? { kind: 'tick' }, watermark: null } } : {},
     taskId: null, taskStepKey: null, taskAttemptOrdinal: null,
     grantId: run.grant ? GRANT_ID : null,
     grantRevisionId: run.grant ? REVISION_ID : null,
@@ -252,20 +264,35 @@ function assessmentCtx(): AssessmentRunContext {
   return {
     grantId: GRANT_ID, grantRevisionId: REVISION_ID, grantorUserId: GRANTOR, threadId: THREAD_ID,
     threadSummary: 'Wisp picture', openConcerns: [], changedSince: null,
-    digest: { alerts: [], tickets: [], incidents: [], runs: [], intents: [] },
-    watch: null, reason: { kind: 'tick' }, readiness: null, nudgeFeedback: [],
+    digest: { alerts: [], tickets: [], incidents: [], runs: [], intents: [], anomalies: [] },
+    watch: null, reason: { kind: 'tick' }, readiness: null, nudgeFeedback: [], firstLook: false, noEarlierAssessment: false,
   };
 }
 
 const hooks: Hooks = {};
 let lastQuery: { prompt: unknown; options: Record<string, unknown> } | undefined;
 
-function scriptQuery(toolCalls: Array<{ tool: string; input: Record<string, unknown> }> = [], text = 'Assessment done.') {
+/**
+ * `viaHandler` runs the registered tool's REAL handler after an allowed pre
+ * hook and feeds its result (text + isError) to the post hook, as
+ * wrapExtraToolWithHooks does; otherwise an allowed call is a static ack.
+ */
+function scriptQuery(
+  toolCalls: Array<{ tool: string; input: Record<string, unknown>; viaHandler?: boolean }> = [],
+  text = 'Assessment done.',
+) {
   queryMock.mockImplementation((params) => {
     lastQuery = params;
     const generator = (async function* () {
       for (const call of toolCalls) {
         const verdict = await hooks.pre!(call.tool, call.input);
+        if (verdict.allowed && call.viaHandler) {
+          const handler = hooks.extraTools?.find((t) => t.name === call.tool)?.handler;
+          if (!handler) throw new Error(`no registered handler for ${call.tool}`);
+          const result = await handler(call.input, {}) as { content: Array<{ text: string }>; isError?: boolean };
+          await hooks.post!(call.tool, call.input, result.content[0]!.text, result.isError === true, 5);
+          continue;
+        }
         await hooks.post!(call.tool, call.input, verdict.allowed ? '{"status":"recorded"}' : JSON.stringify({ error: verdict.error }), !verdict.allowed, 5);
       }
       yield { type: 'assistant', message: { content: [{ type: 'text', text }] } };
@@ -304,10 +331,11 @@ beforeEach(() => {
   getCachedAiKillStateSnapshot.mockReturnValue({ killed: false, epoch: 0 });
   resolveGrantCeiling.mockResolvedValue(ceiling());
   loadAssessmentContext.mockResolvedValue(assessmentCtx());
-  createBreezeMcpServer.mockImplementation((getAuth, pre, post) => {
+  createBreezeMcpServer.mockImplementation((getAuth, pre, post, _session, extraTools) => {
     hooks.getAuth = getAuth;
     hooks.pre = pre;
     hooks.post = post;
+    hooks.extraTools = extraTools as unknown as ExtraTool[] | undefined;
     return { type: 'sdk', name: 'breeze', instance: {} };
   });
   scriptQuery();
@@ -351,6 +379,48 @@ describe('assessment run-loop wiring (Wisp W05b)', () => {
       expect(allowed).toContain(`mcp__breeze__${name}`);
     }
     expect(finalTransition()?.to).toBe('completed');
+  });
+
+  // #10387: the prompt names the run's org, and the record_concern tool the
+  // run actually registers refuses an org subject that is not that org.
+  it('names the run org in the prompt and wires record_concern to refuse another org id', async () => {
+    seedRows({ profile: 'assessment', grant: true });
+    dbMockState.rowQueues.organizations = [[{ id: ORG_ID, partnerId: PARTNER_ID, name: 'Berthoud Vet Care' }]];
+    await executeAgentRun(RUN_ID);
+    const prompt = String(lastQuery?.prompt);
+    expect(prompt).toContain(`Organization id: ${ORG_ID}.`);
+    expect(prompt).toContain('Berthoud Vet Care');
+
+    const record = hooks.extraTools?.find((t) => t.name === 'record_concern');
+    expect(record).toBeDefined();
+    const nil = '00000000-0000-0000-0000-000000000000';
+    const refused = await record!.handler({ subject: { kind: 'org', id: nil }, summary: 'CVEs', severity: 'high' }, {});
+    expect(refused).toMatchObject({ isError: true });
+    expect(JSON.stringify(refused)).toContain(ORG_ID);
+    const ok = await record!.handler({ subject: { kind: 'org', id: ORG_ID }, summary: 'CVEs', severity: 'high' }, {});
+    expect(JSON.stringify(ok)).toContain('recorded');
+  });
+
+  // #10387, end to end: the refused call's isError result reaches the post
+  // hook, which never captures it — so it is neither applied nor even
+  // dropped later as raise_subject_not_in_org.
+  it('a record_concern the tool refused never lands in the outcome or reaches the finalizer', async () => {
+    seedRows({ profile: 'assessment', grant: true });
+    const nil = '00000000-0000-0000-0000-000000000000';
+    scriptQuery([
+      { tool: 'record_concern', input: { subject: { kind: 'org', id: nil }, summary: 'CVEs (wrong id)', severity: 'high' }, viaHandler: true },
+      { tool: 'record_concern', input: { subject: { kind: 'org', id: ORG_ID }, summary: 'CVEs', severity: 'high' }, viaHandler: true },
+    ]);
+    await executeAgentRun(RUN_ID);
+    const final = finalTransition()!;
+    expect(final.to).toBe('completed');
+    const outcome = final.patch.outcome as {
+      assessment: { concernsRaised: Array<{ subject: { id: string } }> }; assessmentSkipped?: string[];
+    };
+    expect(outcome.assessment.concernsRaised.map((r) => r.subject.id)).toEqual([ORG_ID]);
+    expect(outcome.assessmentSkipped).toBeUndefined();
+    expect(upsertConcern).toHaveBeenCalledTimes(1);
+    expect(upsertConcern).toHaveBeenCalledWith(expect.objectContaining({ subject: { kind: 'org', id: ORG_ID } }));
   });
 
   it('an assessment whose grant is inactive (null context) is skipped grant_inactive with no model call', async () => {
@@ -429,6 +499,60 @@ describe('assessment run-loop wiring (Wisp W05b)', () => {
     seedRows({ profile: 'triage', grant: false });
     await executeAgentRun(RUN_ID);
     expect(dispatchSpecialistRequests).not.toHaveBeenCalled();
+  });
+
+  it('#10402: a finished assessment asks for the first-look post, after its final status is written', async () => {
+    seedRows({ profile: 'assessment', grant: true });
+    let statusAtPost: string | undefined;
+    postFirstLookIfDone.mockImplementationOnce(async () => { statusAtPost = finalTransition()?.to; return { posted: true }; });
+    await executeAgentRun(RUN_ID);
+    expect(postFirstLookIfDone).toHaveBeenCalledTimes(1);
+    expect(postFirstLookIfDone).toHaveBeenCalledWith(GRANT_ID);
+    expect(statusAtPost).toBe('completed');
+  });
+
+  it('#10402: a failing first-look post never changes the run outcome (the reconciler re-sweeps it)', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    seedRows({ profile: 'assessment', grant: true });
+    postFirstLookIfDone.mockRejectedValueOnce(new Error('notify down'));
+    await expect(executeAgentRun(RUN_ID)).resolves.not.toThrow();
+    expect(finalTransition()?.to).toBe('completed');
+    consoleError.mockRestore();
+  });
+
+  const CHECK_IN_REASON = { kind: 'check_in', checkInId: '00000000-0000-4000-8000-0000000000c7', instruction: 'Check WS-01.', evidence: null };
+
+  it('W07: a check-in assessment posts its result once, after its final status is written', async () => {
+    seedRows({ profile: 'assessment', grant: true, reason: CHECK_IN_REASON });
+    let statusAtPost: string | undefined;
+    postCheckInRunResult.mockImplementationOnce(async () => { statusAtPost = finalTransition()?.to; return 'posted'; });
+    await executeAgentRun(RUN_ID);
+    expect(postCheckInRunResult).toHaveBeenCalledTimes(1);
+    expect(postCheckInRunResult).toHaveBeenCalledWith(RUN_ID);
+    expect(statusAtPost).toBe('completed');
+  });
+
+  it('W07: a failing check-in post never changes the run outcome (the wake tick re-sweeps it)', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    seedRows({ profile: 'assessment', grant: true, reason: CHECK_IN_REASON });
+    postCheckInRunResult.mockRejectedValueOnce(new Error('notify down'));
+    await expect(executeAgentRun(RUN_ID)).resolves.not.toThrow();
+    expect(finalTransition()?.to).toBe('completed');
+    consoleError.mockRestore();
+  });
+
+  it('W07: an assessment for any other reason, or a non-assessment run, never asks for the check-in post', async () => {
+    seedRows({ profile: 'assessment', grant: true });
+    await executeAgentRun(RUN_ID);
+    seedRows({ profile: 'triage', grant: false });
+    await executeAgentRun(RUN_ID);
+    expect(postCheckInRunResult).not.toHaveBeenCalled();
+  });
+
+  it('#10402: a non-assessment run never asks for the first-look post', async () => {
+    seedRows({ profile: 'triage', grant: false });
+    await executeAgentRun(RUN_ID);
+    expect(postFirstLookIfDone).not.toHaveBeenCalled();
   });
 
   it('a non-assessment run cannot record an assessment outcome', async () => {

@@ -24,6 +24,7 @@ const h = vi.hoisted(() => {
     hasEntitlement: vi.fn(async () => true),
     getActiveGrantForUser: vi.fn(),
     wideningAvailable: vi.fn(async () => false),
+    firstLookPostTimes: vi.fn(async (): Promise<{ firstLookAt: string | null; couldntLookAt: string | null }> => ({ firstLookAt: null, couldntLookAt: null })),
     spendSummary: vi.fn(),
     getOrCreateThread: vi.fn(),
     setThreadFocus: vi.fn(),
@@ -115,6 +116,10 @@ vi.mock('../services/wisp/activity', async (importOriginal) => ({
 vi.mock('../services/wisp/threadTimeline', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/wisp/threadTimeline')>()),
   listThreadTimeline: h.listThreadTimeline,
+}));
+vi.mock('../services/wisp/threadPosts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/wisp/threadPosts')>()),
+  firstLookPostTimes: h.firstLookPostTimes,
 }));
 vi.mock('../services/auditEvents', () => ({ writeRouteAudit: h.writeRouteAudit }));
 vi.mock('../services/sentry', () => ({ captureException: h.captureException }));
@@ -215,7 +220,7 @@ beforeEach(() => {
   h.hasEntitlement.mockResolvedValue(true);
   h.wideningAvailable.mockResolvedValue(false);
   h.resolveGrantCeiling.mockResolvedValue(ceiling);
-  h.spendSummary.mockResolvedValue({ spentTodayCents: 42, budgetCentsPerDay: 200, budgetResetsAt: new Date('2026-10-25T00:00:00Z') });
+  h.spendSummary.mockResolvedValue({ spentTodayCents: 42, backgroundCents: 30, chatCents: 12, budgetCentsPerDay: 200, budgetResetsAt: new Date('2026-10-25T00:00:00Z') });
 });
 
 describe('GET /wisp/thread', () => {
@@ -239,11 +244,11 @@ describe('GET /wisp/thread', () => {
     expect(h.getActiveGrantForUser).not.toHaveBeenCalled();
   });
 
-  it('is 404 no_active_grant when the user has no grant for the scope', async () => {
+  it('is 200 { data: null } when the user has no grant for the scope — an expected miss, not a 404 (#10200)', async () => {
     h.getActiveGrantForUser.mockResolvedValue(null);
     const res = await buildApp().request(`/wisp/thread?orgId=${ORG}`);
-    expect(res.status).toBe(404);
-    expect(await res.json()).toMatchObject({ code: 'no_active_grant' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: null });
     expect(h.getActiveGrantForUser).toHaveBeenCalledWith(USER, { partnerId: PARTNER, orgId: ORG });
     expect(h.getOrCreateThread).not.toHaveBeenCalled();
   });
@@ -263,6 +268,8 @@ describe('GET /wisp/thread', () => {
     expect(h.wideningAvailable).toHaveBeenCalledWith(GRANT_ID);
     expect(h.spendSummary).toHaveBeenCalledWith(GRANT_ID);
     const body = await res.json() as { data: Record<string, unknown> };
+    const meter = body.data.grant as { spentTodayCents: number; backgroundCents: number; chatCents: number };
+    expect(meter.spentTodayCents).toBe(meter.backgroundCents + meter.chatCents);
     expect(body.data).toEqual({
       thread: {
         id: THREAD_ID, grantId: GRANT_ID, summary: 'did things', summaryUpdatedAt: null, lastSessionId: null,
@@ -273,10 +280,23 @@ describe('GET /wisp/thread', () => {
         id: GRANT_ID, status: 'active', orgId: null, expiresAt: '2027-04-01T00:00:00.000Z',
         currentRevisionId: REV, budgetCentsPerDay: 200, floorTickMinutes: 30,
         // w00 A32 spend meter — field names are the cross-wave contract.
-        spentTodayCents: 42, budgetResetsAt: '2026-10-25T00:00:00.000Z', pausedReason: null,
+        spentTodayCents: 42, backgroundCents: 30, chatCents: 12, budgetResetsAt: '2026-10-25T00:00:00.000Z', pausedReason: null, unattendedReads: false, unattendedReadsPinned: false, summaryRefine: false,
       },
       wideningAvailable: widening,
+      firstLookState: 'looking',
     });
+  });
+
+  it.each([
+    [{ firstLookAt: null, couldntLookAt: null }, 'looking'],
+    [{ firstLookAt: null, couldntLookAt: '2027-01-22T10:00:00.000Z' }, 'couldnt_look'],
+    [{ firstLookAt: '2027-01-22T11:00:00.000Z', couldntLookAt: '2027-01-22T10:00:00.000Z' }, 'done'],
+  ])('#11145: carries the first-look state for the chat surfaces (%o → %s)', async (times, state) => {
+    h.getActiveGrantForUser.mockResolvedValue(grant());
+    h.getOrCreateThread.mockResolvedValue(thread());
+    h.firstLookPostTimes.mockResolvedValueOnce(times);
+    const res = await buildApp().request('/wisp/thread');
+    expect((await res.json() as { data: { firstLookState: string } }).data.firstLookState).toBe(state);
   });
 
   it('returns thread.focusOrgId and focusOrgName (no org read when unfocused)', async () => {
@@ -659,14 +679,37 @@ describe('GET /wisp/thread/:id (W06 Task 6)', () => {
         focusOrgName: 'Acme',
         grant: {
           id: GRANT_ID, status: 'active', orgId: null, expiresAt: '2027-04-01T00:00:00.000Z', currentRevisionId: REV,
-          budgetCentsPerDay: 200, floorTickMinutes: 30, spentTodayCents: 42, budgetResetsAt: '2026-10-25T00:00:00.000Z',
+          budgetCentsPerDay: 200, floorTickMinutes: 30, spentTodayCents: 42, backgroundCents: 30, chatCents: 12, budgetResetsAt: '2026-10-25T00:00:00.000Z',
           pausedReason: null,
+          unattendedReads: false, unattendedReadsPinned: false, summaryRefine: false,
         },
         wideningAvailable: false,
+        firstLookState: 'looking',
       },
     });
     expectOwnershipWhere(h.whereArgs[0]);
     expect(h.spendSummary).toHaveBeenCalledWith(GRANT_ID);
+  });
+
+  it('#10973: the switch reads pinned AND live; a live column over an unpinned revision is off', async () => {
+    h.dbResults.push([ownRow({ grantUnattendedReads: true, grantUnattendedReadsPinned: true })]);
+    let body = await (await buildApp().request(`/wisp/thread/${THREAD_ID}`)).json();
+    expect(body.data.grant).toMatchObject({ unattendedReads: true, unattendedReadsPinned: true });
+    h.dbResults.push([ownRow({ grantUnattendedReads: true, grantUnattendedReadsPinned: false })]);
+    body = await (await buildApp().request(`/wisp/thread/${THREAD_ID}`)).json();
+    expect(body.data.grant).toMatchObject({ unattendedReads: false, unattendedReadsPinned: false });
+    h.dbResults.push([ownRow({ grantUnattendedReads: false, grantUnattendedReadsPinned: true })]);
+    body = await (await buildApp().request(`/wisp/thread/${THREAD_ID}`)).json();
+    expect(body.data.grant).toMatchObject({ unattendedReads: false, unattendedReadsPinned: true });
+  });
+
+  it('#10390: carries the session-notes switch, false unless the column is literally true', async () => {
+    h.dbResults.push([ownRow({ grantSummaryRefine: true })]);
+    let body = await (await buildApp().request(`/wisp/thread/${THREAD_ID}`)).json();
+    expect(body.data.grant).toMatchObject({ summaryRefine: true });
+    h.dbResults.push([ownRow({ grantSummaryRefine: false })]);
+    body = await (await buildApp().request(`/wisp/thread/${THREAD_ID}`)).json();
+    expect(body.data.grant).toMatchObject({ summaryRefine: false });
   });
 
   it('carries pausedReason so a paused thread can say why', async () => {
@@ -707,7 +750,7 @@ describe('GET /wisp/thread/:id/activity (W06 Task 14, w00 A31)', () => {
       data: { items: [item], nextCursor: 'abc', current: { orgId: ORG, orgName: 'Acme', startedAt: '2026-10-24T08:05:00.000Z' } },
     });
     expectOwnershipWhere(h.whereArgs[0]);
-    expect(h.resolveGrantCeiling).toHaveBeenCalledWith(GRANT_ID, REV);
+    expect(h.resolveGrantCeiling).toHaveBeenCalledWith(GRANT_ID, REV, { allowPaused: true });
     expect(h.listActivity).toHaveBeenCalledWith(ceiling, { cursor: 'abc', limit: 10, threadId: THREAD_ID });
     expect(h.currentActivity).toHaveBeenCalledWith(GRANT_ID);
   });
@@ -738,11 +781,31 @@ describe('GET /wisp/thread/:id/activity (W06 Task 14, w00 A31)', () => {
     expect((await buildApp().request(`/wisp/thread/${THREAD_ID}/activity?limit=101`)).status).toBe(400);
   });
 
-  it('an inactive grant is 409 grant_inactive', async () => {
-    h.dbResults.push([ownRow()]);
-    h.resolveGrantCeiling.mockRejectedValue(new GrantInactiveError(GRANT_ID, 'paused'));
+  // #10104: a paused grant's thread keeps its activity readable. The resolver
+  // mock behaves like grantAuthority: only an allowPaused read resolves it.
+  it('a PAUSED grant still lists its activity under the stored ceiling; the live line is null (#10104)', async () => {
+    h.dbResults.push([ownRow({ grantStatus: 'paused', grantPausedReason: 'user_paused' })]);
+    const pausedCeiling = { ...ceiling, status: 'paused' };
+    h.resolveGrantCeiling.mockImplementation(async (_g: string, _r: string, opts?: { allowPaused?: boolean }) => {
+      if (opts?.allowPaused) return pausedCeiling;
+      throw new GrantInactiveError(GRANT_ID, 'paused');
+    });
+    h.listActivity.mockResolvedValue({ items: [item], nextCursor: null });
+    // A check admitted before the pause may still be running: a paused grant
+    // never claims "Wisp is checking …".
+    h.currentActivity.mockResolvedValue({ orgId: ORG, orgName: 'Acme', startedAt: '2026-10-24T08:05:00.000Z' });
+    const res = await buildApp().request(`/wisp/thread/${THREAD_ID}/activity?limit=50`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: { items: [item], nextCursor: null, current: null } });
+    expect(h.listActivity).toHaveBeenCalledWith(pausedCeiling, { cursor: undefined, limit: 50, threadId: THREAD_ID });
+  });
+
+  it('a revoked / expired grant is still 409 grant_inactive (only a pause stays readable)', async () => {
+    h.dbResults.push([ownRow({ grantStatus: 'revoked' })]);
+    h.resolveGrantCeiling.mockRejectedValue(new GrantInactiveError(GRANT_ID, 'revoked'));
     const res = await buildApp().request(`/wisp/thread/${THREAD_ID}/activity`);
     expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('grant_inactive');
     expect(h.listActivity).not.toHaveBeenCalled();
   });
 });
@@ -798,7 +861,7 @@ describe('GET /wisp/thread/:id/timeline (W02a #10212)', () => {
   });
 
   it('Review Focus 3: a paused grant reads its history (200)', async () => {
-    h.dbResults.push([ownRow({ grantStatus: 'paused', grantPausedReason: 'user' })]);
+    h.dbResults.push([ownRow({ grantStatus: 'paused', grantPausedReason: 'user_paused' })]);
     h.resolveGrantCeiling.mockResolvedValue({ ...ceiling, status: 'paused' });
     h.listThreadTimeline.mockResolvedValue({ items: [post], nextCursor: null });
     const res = await buildApp().request(`/wisp/thread/${THREAD_ID}/timeline`);
@@ -821,11 +884,14 @@ describe('GET /wisp/thread/:id/timeline (W02a #10212)', () => {
     expect(h.listThreadTimeline).not.toHaveBeenCalled();
   });
 
-  it('the other ceiling reads keep refusing a paused grant (no allowPaused)', async () => {
+  it('reads may resolve a paused grant; a write (focus change) never does (no allowPaused)', async () => {
     h.dbResults.push([ownRow()]);
     h.listActivity.mockResolvedValue({ items: [], nextCursor: null });
     h.currentActivity.mockResolvedValue(null);
     await buildApp().request(`/wisp/thread/${THREAD_ID}/activity`);
-    expect(h.resolveGrantCeiling).toHaveBeenCalledWith(GRANT_ID, REV);
+    expect(h.resolveGrantCeiling).toHaveBeenLastCalledWith(GRANT_ID, REV, { allowPaused: true });
+    h.dbResults.push([ownRow()]);
+    await json(buildApp(), 'PATCH', `/wisp/thread/${THREAD_ID}/focus`, { orgId: ORG });
+    expect(h.resolveGrantCeiling).toHaveBeenLastCalledWith(GRANT_ID, REV);
   });
 });

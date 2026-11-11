@@ -1,3 +1,4 @@
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from '../services/deviceGroupOwnership';
 import { randomUUID } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
@@ -31,6 +32,7 @@ import {
   type AgentCeilingDto,
 } from '@breeze/shared';
 import { zValidator } from '../lib/validation';
+import { selectRunIntentsForCaller } from '../services/aiAgents/runIntentsForCaller';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import {
   actionIntents, aiAgentGraduation, aiAgentRuns, aiAgents, aiToolExecutions, devices, organizations,
@@ -47,6 +49,7 @@ import {
 import { AgentAccessDeniedError, AgentSiteCeilingDeniedError, assertAgentWriteAllowed } from '../services/aiAgents/access';
 import { AgentModelNotAllowedError } from '../services/aiAgents/agentModelErrors';
 import { ResearchAgentEditError } from '../services/aiAgents/researchAgentEdit';
+import { TroubleshootAgentEditError } from '../services/aiAgents/troubleshootAgentEdit';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { getCircuitState, resetCircuit } from '../services/aiAgents/agentCircuit';
 import { readAiKillState } from '../services/aiKillState';
@@ -247,7 +250,7 @@ function isAgentKindConflict(err: unknown): boolean {
 }
 
 export function mapError(c: Context, err: unknown) {
-  if (err instanceof ResearchAgentEditError) {
+  if (err instanceof ResearchAgentEditError || err instanceof TroubleshootAgentEditError) {
     return c.json({ error: err.message, code: err.code, fields: err.fields }, 400);
   }
   if (err instanceof UnsupportedAgentModeError) {
@@ -1491,20 +1494,15 @@ aiAgentsRoutes.get('/runs/:runId', scopes, requireAiRead, async (c) => {
   // it. TWO org predicates: the run's OWN org pins the read, and the caller's
   // condition stays as defence-in-depth beside RLS — same posture as the
   // batched hostname read below.
-  const intentRows = await db
-    .select({
-      id: actionIntents.id,
-      status: actionIntents.status,
-      actionName: actionIntents.actionName,
-      approvalScope: actionIntents.approvalScope,
-      decidedVia: actionIntents.decidedVia,
-    })
-    .from(actionIntents)
-    .where(and(
-      eq(actionIntents.requestingAgentRunId, run.id),
-      eq(actionIntents.orgId, run.orgId),
-      auth.orgCondition(actionIntents.orgId),
-    ));
+  //
+  // W2 #11085: plus the caller's own pending approval row per intent
+  // (selectRunIntentsForCaller's header).
+  const intentRows = await selectRunIntentsForCaller({
+    runId: run.id,
+    runOrgId: run.orgId,
+    userId: auth.user.id,
+    orgCondition: auth.orgCondition(actionIntents.orgId),
+  });
 
   // Phase 2 wave P2-2 (scheduled sweeps), Task A7 — a sweep run is
   // device-less but its findings each name one device, so the detail needs
@@ -2197,6 +2195,8 @@ aiAgentsRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     const body = c.req.valid('json');
+    const partnerGroupIds = await findPartnerOwnedGroupIds(body.triggers?.deviceGroupIds ?? []);
+    if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
     let owner: { orgId: string | null; partnerId: string | null };
 
     if (body.ownerScope === 'partner') {
@@ -2236,6 +2236,8 @@ aiAgentsRoutes.patch(
     const id = uuidParam(c, 'id');
     if (!id) return c.json({ error: 'Agent not found' }, 404);
     try {
+      const partnerGroupIds = await findPartnerOwnedGroupIds(body.triggers?.deviceGroupIds ?? []);
+      if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
       const row = await updateAgent(auth, id, body);
       return c.json({ data: mapRow(row), ...(await flowToolSaveWarnings(row)) });
     } catch (err) {

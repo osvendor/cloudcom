@@ -15,6 +15,19 @@ describe('WispSpendMeter (W06 T15, w00 A32)', () => {
     expect(screen.queryByTestId('wisp-spend-raise')).toBeNull();
   });
 
+  it('shows the background / chat breakdown when both are given (#10414)', () => {
+    render(<WispSpendMeter spentCents={200} budgetCents={500} backgroundCents={30} chatCents={170} resetsAt={RESETS} />);
+    expect(screen.getByTestId('wisp-spend-meter').textContent).toContain('Background $0.30 · Chat $1.70 · $2.00 of $5.00 today');
+  });
+
+  it('shows the plain meter when the breakdown is absent or half-present', () => {
+    const { rerender } = render(<WispSpendMeter spentCents={200} budgetCents={500} resetsAt={RESETS} />);
+    expect(screen.getByTestId('wisp-spend-meter').textContent).toContain('$2.00 of $5.00 today');
+    expect(screen.getByTestId('wisp-spend-meter').textContent).not.toContain('Background');
+    rerender(<WispSpendMeter spentCents={200} budgetCents={500} backgroundCents={30} resetsAt={RESETS} />);
+    expect(screen.getByTestId('wisp-spend-meter').textContent).not.toContain('Background');
+  });
+
   it('turns amber at 80 %', () => {
     render(<WispSpendMeter spentCents={160} budgetCents={200} resetsAt={RESETS} onRaise={vi.fn()} />);
     expect(screen.getByTestId('wisp-spend-meter').getAttribute('data-state')).toBe('warn');
@@ -32,5 +45,35 @@ describe('WispSpendMeter (W06 T15, w00 A32)', () => {
     render(<WispSpendMeter spentCents={200} budgetCents={200} resetsAt={RESETS} />);
     expect(screen.getByTestId('wisp-spend-meter').getAttribute('data-state')).toBe('exhausted');
     expect(screen.queryByTestId('wisp-spend-raise')).toBeNull();
+  });
+
+  it('at the plan ceiling offers no raise and says the budget is at the plan limit (#10106)', () => {
+    render(<WispSpendMeter spentCents={2500} budgetCents={2500} budgetMax={2500} resetsAt={RESETS} onRaise={vi.fn()} />);
+    expect(screen.queryByTestId('wisp-spend-raise')).toBeNull();
+    expect(screen.getByTestId('wisp-spend-at-ceiling')).toHaveTextContent("plan's limit");
+    expect(screen.getByTestId('wisp-spend-plan-link')).toHaveAttribute('href', '/settings/plan');
+  });
+
+  it('below the plan ceiling the exhausted meter still offers the raise (#10106)', () => {
+    render(<WispSpendMeter spentCents={200} budgetCents={200} budgetMax={2500} resetsAt={RESETS} onRaise={vi.fn()} />);
+    expect(screen.getByTestId('wisp-spend-raise')).toBeTruthy();
+    expect(screen.queryByTestId('wisp-spend-at-ceiling')).toBeNull();
+  });
+
+  it('with no onRaise (raising is moot for another reason) no ceiling note shows either', () => {
+    render(<WispSpendMeter spentCents={2500} budgetCents={2500} budgetMax={2500} resetsAt={RESETS} />);
+    expect(screen.queryByTestId('wisp-spend-at-ceiling')).toBeNull();
+    expect(screen.queryByTestId('wisp-spend-raise')).toBeNull();
+  });
+
+  it('with the ceiling unknown the exhausted meter still offers the raise', () => {
+    render(<WispSpendMeter spentCents={200} budgetCents={200} budgetMax={null} resetsAt={RESETS} onRaise={vi.fn()} />);
+    expect(screen.getByTestId('wisp-spend-raise')).toBeTruthy();
+    expect(screen.queryByTestId('wisp-spend-at-ceiling')).toBeNull();
+  });
+
+  it('a budget at the ceiling that is not yet spent shows no ceiling note', () => {
+    render(<WispSpendMeter spentCents={100} budgetCents={2500} budgetMax={2500} resetsAt={RESETS} onRaise={vi.fn()} />);
+    expect(screen.queryByTestId('wisp-spend-at-ceiling')).toBeNull();
   });
 });
