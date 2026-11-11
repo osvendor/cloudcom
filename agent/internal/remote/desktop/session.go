@@ -318,7 +318,16 @@ func (m *SessionManager) notifyActivity() {
 // Eagerly loads OpenH264 in the background so the DLL is ready before
 // the first desktop session (avoids download timeout during IPC).
 func NewSessionManager() *SessionManager {
-	go PreloadOpenH264()
+	return newSessionManager(PreloadOpenH264)
+}
+
+// newSessionManager separates session state from the external codec startup.
+// Session unit tests supply nil: ICE and lease tests must not download or load
+// a native library asynchronously. Production always supplies PreloadOpenH264.
+func newSessionManager(preload func()) *SessionManager {
+	if preload != nil {
+		go preload()
+	}
 	return &SessionManager{
 		sessions: make(map[string]*Session),
 		config:   DefaultConfig(),
