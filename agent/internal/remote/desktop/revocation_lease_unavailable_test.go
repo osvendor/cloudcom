@@ -69,12 +69,12 @@ func TestUnavailableAfterRevocationKeepsOriginalReason(t *testing.T) {
 // The manager-level entry point the agent calls when the control plane answers
 // `revocation_lease_unavailable`. An unknown session id is ignored.
 func TestSessionManagerNoteLeaseUnavailableIsSafeForUnknownSession(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	m.NoteLeaseUnavailable("nope") // must not panic
 }
 
 func TestApplyLeaseUpdateRoutesUnavailable(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	// No session: the call is a no-op, but it must be ROUTED as unavailable,
 	// not decoded as a renewal with zero deadlines (which would mark the
 	// session established and hand it the grace window it must not get).

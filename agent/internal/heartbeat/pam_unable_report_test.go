@@ -43,7 +43,7 @@ func unableReportServer(t *testing.T, status int) (*httptest.Server, func() []ca
 }
 
 func unableReportHeartbeat(serverURL string) *Heartbeat {
-	h := NewWithVersion(&config.Config{AgentID: "agent-9517", ServerURL: serverURL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-9517", ServerURL: serverURL, AuthToken: "token"}, "test", nil, nil)
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0, InitialDelay: time.Millisecond, MaxDelay: time.Millisecond}
 	return h
 }

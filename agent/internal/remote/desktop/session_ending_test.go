@@ -129,7 +129,7 @@ func TestNotifySessionEndingWithoutAControlChannelDoesNotBlock(t *testing.T) {
 // The watchdog must tell the viewer BEFORE it stops the session: once the peer
 // is closed the control channel is gone.
 func TestWatchdogNotifiesTheViewerBeforeAnIdleStop(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession("sess-idle", RevocationLease{
 		ExpiresAt:    time.Now().Add(time.Hour),
 		HardDeadline: time.Now().Add(time.Hour),
@@ -169,7 +169,7 @@ func TestWatchdogNotifiesTheViewerBeforeAnIdleStop(t *testing.T) {
 // returns the session_ending notice it sent first.
 func runWatchdogCapturingNotice(t *testing.T, id string, lease RevocationLease, policy SessionPolicy, before func(m *SessionManager)) map[string]any {
 	t.Helper()
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession(id, lease)
 	notices := make(chan map[string]any, 1)
 	m.notifyEnding = func(_ *Session, body map[string]any) {

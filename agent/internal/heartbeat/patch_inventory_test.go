@@ -32,7 +32,7 @@ func TestSendPatchInventoryDataSendsPendingThenInstalled(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	installed := make([]map[string]any, 251)
@@ -98,7 +98,7 @@ func TestSendPatchInventoryDataSkipsLinuxInstalledPackageInventory(t *testing.T)
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(
@@ -134,7 +134,7 @@ func TestSendPatchInventoryDataStopsWhenPendingUploadFails(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(
@@ -170,7 +170,7 @@ func TestSendPatchInventoryDataFullIncludesCoveredSources(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(
@@ -220,7 +220,7 @@ func TestSendPatchInventoryDataFullOmitsNilCoveredSources(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(
@@ -269,7 +269,7 @@ func TestSendPatchInventoryDataFullIncludesEmptyCoveredSources(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(

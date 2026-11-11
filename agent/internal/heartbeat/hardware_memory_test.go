@@ -40,7 +40,7 @@ func captureHardwarePUT(t *testing.T) (*httptest.Server, chan map[string]json.Ra
 }
 
 func newMemoryHWTestHeartbeat(serverURL string) *Heartbeat {
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", AuthToken: "token", ServerURL: serverURL}, "1.2.3", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", AuthToken: "token", ServerURL: serverURL}, "1.2.3", nil, nil)
 	h.hardwareCollectFn = func() (*collectors.HardwareInfo, error) {
 		return &collectors.HardwareInfo{CPUModel: "Test CPU", CPUCores: 4, CPUThreads: 8, RAMTotalMB: 32768, DiskTotalGB: 512}, nil
 	}

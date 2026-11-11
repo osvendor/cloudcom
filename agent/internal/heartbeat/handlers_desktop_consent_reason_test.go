@@ -121,7 +121,7 @@ func TestHandleStartDesktopConsentCaptureInAnotherSessionTearsDown(t *testing.T)
 			h := &Heartbeat{
 				isService:     true,
 				sessionBroker: newTestBrokerWithSessions(t, c.session, capture),
-				desktopMgr:    desktop.NewSessionManager(),
+				desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 				helperFinder:  func(string) *sessionbroker.Session { return capture },
 			}
 
@@ -154,7 +154,7 @@ func TestHandleStartDesktopConsentCaptureInConsentingSessionProceeds(t *testing.
 			h := &Heartbeat{
 				isService:     true,
 				sessionBroker: newTestBrokerWithSessions(t, c.session, capture),
-				desktopMgr:    desktop.NewSessionManager(),
+				desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 				helperFinder:  func(string) *sessionbroker.Session { return capture },
 			}
 
@@ -188,7 +188,7 @@ func TestHandleStartDesktopConsentPinsUntargetedWindowsCapture(t *testing.T) {
 	h := &Heartbeat{
 		isService:     true,
 		sessionBroker: newTestBrokerWithSessions(t, c.session, capture),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		helperFinder: func(target string) *sessionbroker.Session {
 			asked = append(asked, target)
 			return capture
@@ -218,7 +218,7 @@ func TestHandleStartDesktopNoUserSessionRechecksOccupancy(t *testing.T) {
 	h := &Heartbeat{
 		isService:     true,
 		sessionBroker: newTestBrokerWithSessions(t, capture),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		helperFinder: func(string) *sessionbroker.Session {
 			// Someone signs in while the capture helper comes up.
 			consentOccupancyFn = func(string) string { return occupancyOccupied }
@@ -252,7 +252,7 @@ func TestHandleStartDesktopConsentProceedReportsNoUserSession(t *testing.T) {
 	h := &Heartbeat{
 		isService:     true,
 		sessionBroker: newTestBrokerWithSessions(t), // no consent_ui helper
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		helperFinder:  func(string) *sessionbroker.Session { return helper },
 	}
 
@@ -274,7 +274,7 @@ func TestHandleStartDesktopConsentRefusesSignedInUserWhoCannotBeAsked(t *testing
 			h := &Heartbeat{
 				isService:     true,
 				sessionBroker: newTestBrokerWithSessions(t),
-				desktopMgr:    desktop.NewSessionManager(),
+				desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 				helperFinder: func(string) *sessionbroker.Session {
 					t.Fatal("capture must not start when the gate refuses")
 					return nil
@@ -308,7 +308,7 @@ func TestHandleStartDesktopConsentProceedReportsTimeout(t *testing.T) {
 	h := &Heartbeat{
 		isService:     true,
 		sessionBroker: newTestBrokerWithSessions(t, c.session),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		helperFinder:  func(string) *sessionbroker.Session { return helper },
 	}
 
@@ -342,7 +342,7 @@ func TestHandleStartDesktopConsentBindingLostTearsDown(t *testing.T) {
 	h := &Heartbeat{
 		isService:     true,
 		sessionBroker: newTestBrokerWithSessions(t, c.session, helper),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		helperFinder: func(string) *sessionbroker.Session {
 			// The user signs out between answering and capture starting.
 			_ = c.session.Close()

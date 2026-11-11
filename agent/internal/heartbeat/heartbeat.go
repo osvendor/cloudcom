@@ -1284,6 +1284,12 @@ func newHeartbeatHTTPClient(tlsCfg *tls.Config) *http.Client {
 }
 
 func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureString, tlsCfg *tls.Config) *Heartbeat {
+	return newWithVersion(cfg, version, token, tlsCfg, desktop.PreloadOpenH264)
+}
+
+// newWithVersion keeps codec startup injectable per instance so command and
+// consent tests do not initiate native-library downloads in the background.
+func newWithVersion(cfg *config.Config, version string, token *secmem.SecureString, tlsCfg *tls.Config, preload func()) *Heartbeat {
 	secToken := token
 	if secToken == nil && cfg.AuthToken != "" {
 		secToken = secmem.NewSecureString(cfg.AuthToken)
@@ -1324,7 +1330,7 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 		reliabilityCol:                 collectors.NewReliabilityCollector(),
 		agentVersion:                   version,
 		executor:                       executor.New(cfg),
-		desktopMgr:                     desktop.NewSessionManager(),
+		desktopMgr:                     desktop.NewSessionManagerWithPreloader(preload),
 		wsDesktopMgr:                   desktop.NewWsSessionManager(),
 		terminalMgr:                    terminal.NewManager(),
 		tunnelMgr:                      tunnel.NewManager(false),

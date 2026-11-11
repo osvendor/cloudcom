@@ -57,7 +57,7 @@ func TestHelperLocalICECandidateIsForwardedToTheControlPlane(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker:    newTestBrokerWithSessions(t, session),
 		isHeadless:       true,
-		desktopMgr:       desktop.NewSessionManager(),
+		desktopMgr:       desktop.NewSessionManagerWithPreloader(nil),
 		desktopICESender: recordingICESender(sent),
 	}
 	h.rememberDesktopOwner("desk-ice", session.SessionID)
@@ -87,7 +87,7 @@ func TestHelperLocalICECandidateFromANonOwnerIsDropped(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker:    newTestBrokerWithSessions(t, owner, stranger),
 		isHeadless:       true,
-		desktopMgr:       desktop.NewSessionManager(),
+		desktopMgr:       desktop.NewSessionManagerWithPreloader(nil),
 		desktopICESender: recordingICESender(sent),
 	}
 	h.rememberDesktopOwner("desk-ice-owned", owner.SessionID)
@@ -111,7 +111,7 @@ func TestHelperLocalICECandidateOversizedIsDropped(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker:    newTestBrokerWithSessions(t, session),
 		isHeadless:       true,
-		desktopMgr:       desktop.NewSessionManager(),
+		desktopMgr:       desktop.NewSessionManagerWithPreloader(nil),
 		desktopICESender: recordingICESender(sent),
 	}
 	h.rememberDesktopOwner("desk-ice-big", session.SessionID)
@@ -134,7 +134,7 @@ func TestRelayedViewerICECandidateReachesTheOwningHelper(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
 		isHeadless:    true,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	h.rememberDesktopOwner("desk-remote-ice", session.SessionID)
 

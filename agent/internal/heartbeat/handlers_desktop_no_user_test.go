@@ -84,7 +84,7 @@ func TestHandleStartDesktopOnDemandNotifySkipsConsentWaitWhenNoUser(t *testing.T
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := runStartDesktopWithin(t, h, noUserStartCmd("sess-notify-nouser", notifyModePrompt()), 5*time.Second)
@@ -101,7 +101,7 @@ func TestHandleStartDesktopOnDemandConsentBlockDeniesFastWhenNoUser(t *testing.T
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := runStartDesktopWithin(t, h, noUserStartCmd("sess-consent-block-nouser", consentModePrompt("block", 30000)), 5*time.Second)
@@ -128,7 +128,7 @@ func TestHandleStartDesktopOnDemandConsentProceedAppliesPolicyWhenNoUser(t *test
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := runStartDesktopWithin(t, h, noUserStartCmd("sess-consent-proceed-nouser", consentModePrompt("proceed", 30000)), 5*time.Second)
@@ -144,7 +144,7 @@ func TestHandleStartDesktopOnDemandWaitsForConsentHelperWhenUserSignedIn(t *test
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := runStartDesktopWithin(t, h, noUserStartCmd("sess-signed-in", consentModePrompt("block", 10)), 5*time.Second)
@@ -167,7 +167,7 @@ func TestHandleStartDesktopOnDemandAvailabilityErrorKeepsWait(t *testing.T) {
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := runStartDesktopWithin(t, h, noUserStartCmd("sess-check-err", consentModePrompt("block", 10)), 5*time.Second)
@@ -188,7 +188,7 @@ func TestHandleStartDesktopOnDemandPromptOffSkipsAvailabilityCheck(t *testing.T)
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	runStartDesktopWithin(t, h, noUserStartCmd("sess-off", &ipc.DesktopPrompt{Mode: "off"}), 5*time.Second)

@@ -16,7 +16,7 @@ import (
 
 func newSyncHeartbeat(t *testing.T) *Heartbeat {
 	t.Helper()
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 	h.desktopFenceSyncTimeout = 2 * time.Second
 	return h
 }

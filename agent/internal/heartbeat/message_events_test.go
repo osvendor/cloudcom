@@ -119,7 +119,7 @@ func TestPostMessageEventSendsAgentAuthenticatedRequest(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 	win := uint32(2)
 	err := h.postMessageEvent(messageEvent{
 		MessageID: "m1",

@@ -41,7 +41,7 @@ func TestSendElevationRequestParsesIngestDecision(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		ServerURL: ts.URL,
 		AuthToken: "token",
@@ -76,7 +76,7 @@ func TestReportLocalPamDecision(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 	if err := h.reportLocalPamDecision("req-123", "denied"); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestSendElevationRequestErrorsOnServerError(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		ServerURL: ts.URL,
 		AuthToken: "token",
@@ -136,7 +136,7 @@ func TestSendElevationRequestErrorsOnNonRetryableStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		ServerURL: ts.URL,
 		AuthToken: "token",
@@ -177,7 +177,7 @@ func TestSendElevationRequestMalformedBodyIsNonFatal(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			h := NewWithVersion(&config.Config{
+			h := newTestHeartbeatWithVersion(&config.Config{
 				AgentID:   "agent-1",
 				ServerURL: ts.URL,
 				AuthToken: "token",

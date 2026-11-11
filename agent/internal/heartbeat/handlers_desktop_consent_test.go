@@ -96,7 +96,7 @@ func TestConsentGate_NoHelper_Block(t *testing.T) {
 	withConsentSeams(t, occupancyUnoccupied, true)
 	h := &Heartbeat{
 		// No sessionBroker → no helper can show the prompt.
-		desktopMgr: desktop.NewSessionManager(),
+		desktopMgr: desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-nohelper-block",
@@ -111,7 +111,7 @@ func TestConsentGate_NoHelper_Block(t *testing.T) {
 func TestConsentGate_NoHelper_Proceed(t *testing.T) {
 	withConsentSeams(t, occupancyUnoccupied, true)
 	h := &Heartbeat{
-		desktopMgr: desktop.NewSessionManager(),
+		desktopMgr: desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-nohelper-proceed",
@@ -125,7 +125,7 @@ func TestConsentGate_NoHelper_Proceed(t *testing.T) {
 // prompt, and "proceed" must NOT start the session.
 func TestConsentGate_NoHelper_SignedInUserBlocksDespiteProceed(t *testing.T) {
 	withConsentSeams(t, occupancyOccupied, true)
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-nohelper-occupied",
 		consentModePrompt("proceed", 5000)))
@@ -173,7 +173,7 @@ func TestConsentGate_UserDenies_EndToEnd(t *testing.T) {
 	broker := newTestBrokerWithSessions(t, session)
 	h := &Heartbeat{
 		sessionBroker: broker,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-deny", consentModePrompt("block", 5000)))
@@ -204,7 +204,7 @@ func TestConsentGate_LegacyHelperSilence_Blocks(t *testing.T) {
 	broker := newTestBrokerWithSessions(t, session)
 	h := &Heartbeat{
 		sessionBroker: broker,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-timeout-block", consentModePrompt("proceed", 100)))
@@ -252,7 +252,7 @@ func TestConsentGate_HelperErrorReply_FailsClosed_Proceed(t *testing.T) {
 	broker := newTestBrokerWithSessions(t, session)
 	h := &Heartbeat{
 		sessionBroker: broker,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	// "proceed" policy — the fail-closed behavior must override it.
@@ -303,7 +303,7 @@ func TestConsentGate_HelperUndecodablePayload_FailsClosed_Proceed(t *testing.T) 
 	broker := newTestBrokerWithSessions(t, session)
 	h := &Heartbeat{
 		sessionBroker: broker,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-baddata", consentModePrompt("proceed", 5000)))
@@ -358,7 +358,7 @@ func TestConsentGate_LegacyAssistAllow(t *testing.T) {
 // session proceeds.
 func TestConsentGate_NonConsentMode_Skips(t *testing.T) {
 	h := &Heartbeat{
-		desktopMgr: desktop.NewSessionManager(),
+		desktopMgr: desktop.NewSessionManagerWithPreloader(nil),
 		// No sessionBroker — if the gate ran, it would block.
 	}
 
@@ -389,7 +389,7 @@ func TestConsentGate_NonConsentMode_Skips(t *testing.T) {
 // present in the payload (older API), the consent gate is skipped entirely.
 func TestConsentGate_NilPrompt_Skips(t *testing.T) {
 	h := &Heartbeat{
-		desktopMgr: desktop.NewSessionManager(),
+		desktopMgr: desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	result := handleStartDesktop(h, Command{
@@ -483,7 +483,7 @@ func TestConsentGate_FallbackScope_EndToEnd(t *testing.T) {
 		}
 	}()
 
-	h := &Heartbeat{sessionBroker: newTestBrokerWithSessions(t, c.session), desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{sessionBroker: newTestBrokerWithSessions(t, c.session), desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-fallback", consentModePrompt("block", 5000)))
 
@@ -534,7 +534,7 @@ func TestConsentGate_AssistHelperPreferredOverFallback(t *testing.T) {
 	}()
 
 	broker := newTestBrokerWithSessions(t, assistSession, fallbackSession)
-	h := &Heartbeat{sessionBroker: broker, desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{sessionBroker: broker, desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-prefer-assist", consentModePrompt("block", 5000)))
 

@@ -32,7 +32,7 @@ func elevationTestServer(t *testing.T, body string) *httptest.Server {
 func TestSendElevationRequestParsesSupportName(t *testing.T) {
 	t.Run("present", func(t *testing.T) {
 		ts := elevationTestServer(t, `{"id":"req-123","status":"pending","supportName":"Contoso IT"}`)
-		h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+		h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 		outcome, err := h.SendElevationRequest(sampleElevationEvent())
 		if err != nil {
 			t.Fatal(err)
@@ -47,7 +47,7 @@ func TestSendElevationRequestParsesSupportName(t *testing.T) {
 
 	t.Run("absent leaves the cache unchanged", func(t *testing.T) {
 		ts := elevationTestServer(t, `{"id":"req-124","status":"pending"}`)
-		h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+		h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 		h.rememberSupportName("Contoso IT")
 		outcome, err := h.SendElevationRequest(sampleElevationEvent())
 		if err != nil {
@@ -63,7 +63,7 @@ func TestSendElevationRequestParsesSupportName(t *testing.T) {
 
 	t.Run("malformed supportName does not lose the ingest decision", func(t *testing.T) {
 		ts := elevationTestServer(t, `{"id":"req-125","status":"pending","supportName":42}`)
-		h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+		h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 		outcome, err := h.SendElevationRequest(sampleElevationEvent())
 		if err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestSendElevationRequestParsesSupportName(t *testing.T) {
 	t.Run("oversized supportName is truncated on the outcome", func(t *testing.T) {
 		long := strings.Repeat("x", 150)
 		ts := elevationTestServer(t, `{"id":"req-126","status":"pending","supportName":"`+long+`"}`)
-		h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+		h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 		outcome, err := h.SendElevationRequest(sampleElevationEvent())
 		if err != nil {
 			t.Fatal(err)

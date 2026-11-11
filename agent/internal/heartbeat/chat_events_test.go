@@ -237,7 +237,7 @@ func TestPostChatReplyAgainstServer(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"conversation_closed"}`))
 	}))
 	defer ts.Close()
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 	win := uint32(1)
 	status, err := h.postChatReply(chatReplyEvent{
 		EventType: "chat_reply", ConversationID: testConvID, ClientNonce: testNonce, Body: "hi",

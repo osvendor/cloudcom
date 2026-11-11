@@ -22,7 +22,7 @@ import (
 // resubmitted, and that the resubmission is bounded.
 
 func fastProductionRetryConfig() httputil.RetryConfig {
-	cfg := httputil.DefaultRetryConfig() // the config New() installs
+	cfg := httputil.DefaultRetryConfig() // the config newTestHeartbeatWithoutCodec() installs
 	cfg.InitialDelay = time.Millisecond
 	cfg.MaxDelay = time.Millisecond
 	return cfg

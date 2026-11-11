@@ -58,7 +58,7 @@ func newOrderingTestHeartbeat(t *testing.T, status int, bodies chan<- map[string
 	}))
 	t.Cleanup(server.Close)
 
-	return NewWithVersion(&config.Config{
+	return newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		AuthToken: "token",
 		ServerURL: server.URL,
@@ -314,7 +314,7 @@ func TestSendConfigurationChangesSerializesOverlappingCycles(t *testing.T) {
 	}))
 	defer server.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		AuthToken: "token",
 		ServerURL: server.URL,
@@ -405,7 +405,7 @@ func TestSendPolicyStateRegistryEndpoint(t *testing.T) {
 			}))
 			defer server.Close()
 
-			h := NewWithVersion(&config.Config{
+			h := newTestHeartbeatWithVersion(&config.Config{
 				AgentID:   "agent-1",
 				AuthToken: "token",
 				ServerURL: server.URL,

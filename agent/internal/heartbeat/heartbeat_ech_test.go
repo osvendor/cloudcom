@@ -56,7 +56,7 @@ func TestNewWithVersion_AppliesECHSwitchesToSharedDialer(t *testing.T) {
 				t.Fatalf("precondition: shared dialer enabled = %v, want %v", !start, start)
 			}
 
-			_ = NewWithVersion(&config.Config{
+			_ = newTestHeartbeatWithVersion(&config.Config{
 				AgentID:          "agent-1",
 				ServerURL:        "http://127.0.0.1:1",
 				AuthToken:        "t",
@@ -65,7 +65,7 @@ func TestNewWithVersion_AppliesECHSwitchesToSharedDialer(t *testing.T) {
 			}, "test", nil, nil)
 
 			if got := ech.SharedEnabledForTest(); got != tc.want {
-				t.Fatalf("shared ECH dialer enabled = %v after NewWithVersion(ech=%v, ech_server_enabled=%v), want %v",
+				t.Fatalf("shared ECH dialer enabled = %v after newTestHeartbeatWithVersion(ech=%v, ech_server_enabled=%v), want %v",
 					got, tc.local, tc.server, tc.want)
 			}
 			if got := ech.Shared().Status("cp.example.com").Disabled; got != tc.wantDisabled {

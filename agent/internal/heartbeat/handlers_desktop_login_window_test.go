@@ -33,7 +33,7 @@ func loginWindowTestHeartbeat(t *testing.T, consoleUser string) *Heartbeat {
 	broker.SetConsoleUser(consoleUser)
 	return &Heartbeat{
 		sessionBroker: broker,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 }
 
@@ -119,7 +119,7 @@ func TestHandleStartDesktopLoginWindowGateIsMacOnly(t *testing.T) {
 func TestHandleStartDesktopLoginWindowGateWithoutBroker(t *testing.T) {
 	withConsentSeams(t, occupancyOccupied, true)
 	withDesktopStartHostOS(t, "darwin")
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 
 	result := handleStartDesktop(h, startDesktopCmd("sess-no-broker", consentModePrompt("block", 5000)))
 

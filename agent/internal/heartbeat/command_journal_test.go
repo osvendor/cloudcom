@@ -334,7 +334,7 @@ func TestNewWithVersion_RecoversInterruptedCommands(t *testing.T) {
 	}
 	newCommandJournal(commandJournalDir(outboxRoot)).Begin(Command{ID: journalTestCmdID, Type: tools.CmdInstallPatches})
 
-	_ = NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: "http://127.0.0.1:1", AuthToken: "t"}, "test", nil, nil)
+	_ = newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: "http://127.0.0.1:1", AuthToken: "t"}, "test", nil, nil)
 
 	got := flushAll(t, newBackupResultOutbox(outboxRoot))
 	if len(got) != 1 || got[0].CommandID != journalTestCmdID || got[0].Error != interruptedCommandError {

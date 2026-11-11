@@ -33,7 +33,7 @@ func newStreamHarness(t *testing.T) *streamHarness {
 	t.Helper()
 	s := &streamHarness{}
 	s.h = &Heartbeat{
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	s.h.desktopFenceSyncTimeout = 2 * time.Second
@@ -450,7 +450,7 @@ func keys(m map[string]*ipc.Envelope) []string {
 
 func TestRevocationLeaseAnswersReachTheStreamManager(t *testing.T) {
 	h := &Heartbeat{
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	// A revoked answer for a stream session must stop it (through the same
@@ -500,7 +500,7 @@ func testStreamLease(expiresIn time.Duration) *desktop.RevocationLease {
 // state — renewal, "cannot answer" on a never-renewed stream, and revocation.
 func TestRevocationLeaseAnswersReachTheStreamLease(t *testing.T) {
 	mgr := newTestStreamManager()
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager(), wsDesktopMgr: mgr}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil), wsDesktopMgr: mgr}
 	send := func(string, []byte) error { return nil }
 
 	_, _, renewed, err := mgr.StartSession("ws-renew", 0, desktop.DefaultStreamConfig(), testStreamLease(time.Minute), send)
@@ -545,7 +545,7 @@ func TestRevocationLeaseAnswersReachTheStreamLease(t *testing.T) {
 func TestWsStreamWatchdogStopReportsTheDisconnectAndHidesTheIndicator(t *testing.T) {
 	helper := newConsentHelper(t, []string{"consent_ui"})
 	h := &Heartbeat{
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr:  desktop.NewWsSessionManager(),
 		sessionBroker: newTestBrokerWithSessions(t, helper.session),
 	}

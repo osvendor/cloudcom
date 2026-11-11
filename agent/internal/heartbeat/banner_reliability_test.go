@@ -26,7 +26,7 @@ const (
 func bannerTestHeartbeat(t *testing.T, helper *atomic.Pointer[sessionbroker.Session]) *Heartbeat {
 	t.Helper()
 	h := &Heartbeat{
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	h.sessionBroker = newTestBrokerWithSessions(t)

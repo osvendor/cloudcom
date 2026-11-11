@@ -213,7 +213,7 @@ func TestTerminalAfterStartKeepsTheOwnerMappingWhenTheStopFails(t *testing.T) {
 
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	h.desktopStartFence.noteStop("desktop-1", desktopStopFenceInput{Generation: 5, HasGeneration: true})
 	h.rememberDesktopOwner("desktop-1", session.SessionID)

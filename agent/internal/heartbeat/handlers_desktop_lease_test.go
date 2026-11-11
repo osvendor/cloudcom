@@ -261,7 +261,7 @@ func TestHandleStartDesktopOnDemandRejectsSessionZero(t *testing.T) {
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 
 	cmd := startDesktopCmd("sess-zero", consentModePrompt("block", 10))
@@ -383,7 +383,7 @@ func TestHandleStartDesktopOnDemandDefaultsTargetAndReleasesOnConsentDenied(t *t
 	h := &Heartbeat{
 		helperLifecycle: f,
 		sessionBroker:   newTestBrokerWithSessions(t),
-		desktopMgr:      desktop.NewSessionManager(),
+		desktopMgr:      desktop.NewSessionManagerWithPreloader(nil),
 	}
 	consoleID := h.sessionBroker.ConsoleSessionID()
 	wantWinID, err := sessionbroker.ParseWindowsSessionIDForHeartbeat(consoleID)
@@ -485,7 +485,7 @@ func TestStartDesktopViaHelperAlwaysOnKeepsLegacyPath(t *testing.T) {
 
 func TestHandleStopDesktopReleasesLeases(t *testing.T) {
 	f := &fakeLifecycle{mode: "on-demand"}
-	h := &Heartbeat{helperLifecycle: f, desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{helperLifecycle: f, desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 	if res := h.acquireDesktopLeases("sess-stop", 3, true); res != nil {
 		t.Fatalf("acquire failed: %+v", res)
 	}

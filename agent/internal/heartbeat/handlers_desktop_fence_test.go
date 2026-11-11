@@ -35,7 +35,7 @@ func fenceStartCommand(commandID string, payload map[string]any) Command {
 // handlers_desktop_fence_sync_test.go). The control plane answers "live, no
 // generation" — the weakest answer that still certifies a session.
 func newFenceHeartbeat() *Heartbeat {
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 	h.desktopFenceSyncTimeout = 5 * time.Second
 	h.leaseSyncRequester = func(sessionID, nonce string) error {
 		go h.applyRevocationLeaseAnswer(websocket.RevocationLeaseMessage{

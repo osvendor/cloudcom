@@ -12,7 +12,7 @@ func TestSessionManagerStartsCodecWithoutBlocking(t *testing.T) {
 	created := make(chan *SessionManager, 1)
 	defer close(release)
 	go func() {
-		created <- newSessionManager(func() {
+		created <- NewSessionManagerWithPreloader(func() {
 			close(started)
 			<-release
 			close(finished)

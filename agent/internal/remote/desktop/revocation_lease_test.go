@@ -209,7 +209,7 @@ func waitForStop(t *testing.T, stopped chan string, want bool) {
 // The watchdog is driven on millisecond timers here; in production the same
 // state machine runs on the 25s renew / 90s grace / 12h deadline values.
 func TestWatchdogStopsOnRevocation(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession("sess-revoke", RevocationLease{
 		ExpiresAt:    time.Now().Add(time.Hour),
 		HardDeadline: time.Now().Add(time.Hour),
@@ -226,7 +226,7 @@ func TestWatchdogStopsOnRevocation(t *testing.T) {
 }
 
 func TestWatchdogStopsWhenLeaseExpiresPastGrace(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	// Already expired, with a grace window that lapses almost immediately: this
 	// is the "API unreachable, nothing ever renews" path.
 	s := newWatchdogTestSession("sess-expired", RevocationLease{
@@ -244,7 +244,7 @@ func TestWatchdogStopsWhenLeaseExpiresPastGrace(t *testing.T) {
 }
 
 func TestWatchdogStopsAtTheHardDeadlineDespiteHealthyRenewals(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession("sess-deadline", RevocationLease{
 		ExpiresAt:    time.Now().Add(time.Hour), // lease is perfectly healthy
 		HardDeadline: time.Now().Add(5 * time.Millisecond),
@@ -269,7 +269,7 @@ func TestWatchdogStopsAtTheHardDeadlineDespiteHealthyRenewals(t *testing.T) {
 }
 
 func TestWatchdogKeepsStreamingWhileRenewalsSucceed(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession("sess-healthy", RevocationLease{
 		ExpiresAt:    time.Now().Add(20 * time.Millisecond),
 		HardDeadline: time.Now().Add(time.Hour),
@@ -300,7 +300,7 @@ func TestWatchdogKeepsStreamingWhileRenewalsSucceed(t *testing.T) {
 }
 
 func TestWatchdogExitsWhenTheSessionStops(t *testing.T) {
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	s := newWatchdogTestSession("sess-exit", RevocationLease{
 		ExpiresAt:    time.Now().Add(time.Hour),
 		HardDeadline: time.Now().Add(time.Hour),

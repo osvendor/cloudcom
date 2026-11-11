@@ -30,7 +30,7 @@ func TestHelperManagerOwnershipFollowsInstalledAgent(t *testing.T) {
 			cfg.IsService = tc.isService
 			cfg.IsInstalledAgent = tc.isInstalledAgent
 			cfg.SupportMode = tc.supportMode
-			h := New(cfg)
+			h := newTestHeartbeatWithoutCodec(cfg)
 			defer h.Stop()
 
 			if h.helperMgr == nil {

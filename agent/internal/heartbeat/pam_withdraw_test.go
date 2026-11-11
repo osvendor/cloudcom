@@ -92,7 +92,7 @@ func (s *withdrawServer) count() int {
 
 func newWithdrawHeartbeat(t *testing.T, serverURL string) (*Heartbeat, *pamdecline.Store, *withdrawClock) {
 	t.Helper()
-	h := NewWithVersion(&config.Config{AgentID: "agent-8971", ServerURL: serverURL, AuthToken: "token-8971"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-8971", ServerURL: serverURL, AuthToken: "token-8971"}, "test", nil, nil)
 	clock := &withdrawClock{t: time.Date(2027, 1, 10, 10, 0, 0, 0, time.UTC)}
 	store := pamdecline.NewStore("", clock.now)
 	h.pamDeclines = store

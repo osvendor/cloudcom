@@ -344,7 +344,7 @@ func TestSessionManager_AddRemoteICECandidateAfterAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := newSessionManager(nil)
+	m := NewSessionManagerWithPreloader(nil)
 	m.mu.Lock()
 	m.sessions[s.id] = s
 	m.mu.Unlock()

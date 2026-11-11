@@ -401,7 +401,7 @@ func TestHandleStopDesktopFallsThroughToDirectWhenOwnerHelperGone(t *testing.T) 
 	h := &Heartbeat{
 		sessionBroker: broker,
 		isHeadless:    true,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	// Owner registered, but its helper session ("missing-session") is not in the
 	// broker, so desktopOwnerSession resolves to nil.

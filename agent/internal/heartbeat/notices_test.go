@@ -578,31 +578,53 @@ func TestStartPromptHostWiresNoticesAndTheTCCRule(t *testing.T) {
 	eventually(t, func() bool { return promptShows(probe) == 1 }, "the notice through the wired handler")
 }
 
-// NewWithVersion cannot be stood up in a unit test (it opens the IPC broker
-// for real), so pin structurally that it calls startPromptHost.
+// Pin both the production constructor delegation (including real codec startup)
+// and the shared constructor's prompt host wiring without opening a real broker.
 func TestNewWithVersionStartsThePromptHost(t *testing.T) {
 	file, err := parser.ParseFile(token.NewFileSet(), "heartbeat.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fn *ast.FuncDecl
+	funcs := make(map[string]*ast.FuncDecl)
 	for _, d := range file.Decls {
-		if f, ok := d.(*ast.FuncDecl); ok && f.Name.Name == "NewWithVersion" {
-			fn = f
+		if f, ok := d.(*ast.FuncDecl); ok {
+			funcs[f.Name.Name] = f
 		}
 	}
-	if fn == nil {
-		t.Fatal("NewWithVersion not found in heartbeat.go; update this guard")
+	wrapper, impl := funcs["NewWithVersion"], funcs["newWithVersion"]
+	if wrapper == nil || impl == nil {
+		t.Fatal("heartbeat constructors missing; update guard")
+	}
+	delegates := false
+	ast.Inspect(wrapper, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok || name.Name != "newWithVersion" || len(call.Args) != 5 {
+			return true
+		}
+		preload, ok := call.Args[4].(*ast.SelectorExpr)
+		if !ok || preload.Sel.Name != "PreloadOpenH264" {
+			return true
+		}
+		pkg, ok := preload.X.(*ast.Ident)
+		delegates = ok && pkg.Name == "desktop"
+		return true
+	})
+	if !delegates {
+		t.Fatal("production constructor must delegate with real codec preload")
 	}
 	calls := false
-	ast.Inspect(fn, func(n ast.Node) bool {
+	ast.Inspect(impl, func(n ast.Node) bool {
 		if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "startPromptHost" {
 			calls = true
 		}
 		return true
 	})
 	if !calls {
-		t.Fatal("NewWithVersion no longer calls startPromptHost: no notice kind, prompt sink or TCC rule in production")
+		t.Fatal("constructor no longer starts prompt host: notices and TCC rule would be absent")
 	}
 }
 

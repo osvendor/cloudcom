@@ -52,7 +52,7 @@ func TestSendElevationRequestSendsTheRendererAndReadsTheDeadline(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"` + elevReq + `","status":"pending","pendingExpiresAt":"` + expires.Format(time.RFC3339Nano) + `"}`))
 	}))
 	defer ts.Close()
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 	host := prompthost.New(prompthost.Deps{Broker: &rcDir{rs: []prompthost.RendererSession{elevAssist("assist-1")}}})
 	promptkinds.Register(host)
 	host.SetEnabledKinds(elevEnabled)
@@ -84,7 +84,7 @@ func TestSendElevationRequestIgnoresAMalformedDeadline(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"` + elevReq + `","status":"pending","pendingExpiresAt":42}`))
 	}))
 	defer ts.Close()
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
 	outcome, err := h.SendElevationRequest(sampleElevationEvent())
 	if err != nil || outcome.Status != "pending" || !outcome.PendingExpiresAt.IsZero() {
 		t.Fatalf("outcome = %+v, %v (a bad deadline must not cost the decision)", outcome, err)

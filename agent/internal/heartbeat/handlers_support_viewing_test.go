@@ -188,7 +188,7 @@ func TestSupportViewerComesFromTheStartPrompt(t *testing.T) {
 func TestSupportViewingObserverChainsTheWebRTCHooks(t *testing.T) {
 	h := &Heartbeat{
 		supportMode:  true,
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	var previousStops atomic.Int32
@@ -210,7 +210,7 @@ func TestSupportViewingObserverChainsTheWebRTCHooks(t *testing.T) {
 
 func TestSupportViewingObserverIsInertOnAnInstalledAgent(t *testing.T) {
 	h := &Heartbeat{
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	var pokes atomic.Int32
@@ -226,7 +226,7 @@ func TestSupportViewingObserverIsInertOnAnInstalledAgent(t *testing.T) {
 // WebSocket path.
 func TestSupportViewerIsNotRenamedByADeniedWebRTCStart(t *testing.T) {
 	withConsentSeams(t, occupancyUnoccupied, true)
-	h := &Heartbeat{supportMode: true, desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{supportMode: true, desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 	first := "Alice"
 	h.noteSupportViewer(&ipc.DesktopPrompt{Mode: "notify", TechnicianName: &first})
 
@@ -244,7 +244,7 @@ func TestSupportViewerIsNotRenamedByADeniedWebRTCStart(t *testing.T) {
 func TestSupportViewingObserverIsPokedByAWebRTCStopSession(t *testing.T) {
 	h := &Heartbeat{
 		supportMode:  true,
-		desktopMgr:   desktop.NewSessionManager(),
+		desktopMgr:   desktop.NewSessionManagerWithPreloader(nil),
 		wsDesktopMgr: desktop.NewWsSessionManager(),
 	}
 	var pokes atomic.Int32

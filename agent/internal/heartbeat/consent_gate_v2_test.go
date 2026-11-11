@@ -522,7 +522,7 @@ func TestEndingASessionWithdrawsItsPendingConsentPrompt(t *testing.T) {
 			c := newConsentTestHelper(t, "helper-withdraw", []string{ipc.ScopeConsentUI}, ipc.ConsentProtocolVersion)
 			h := &Heartbeat{
 				sessionBroker: newTestBrokerWithSessions(t, c.session),
-				desktopMgr:    desktop.NewSessionManager(),
+				desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 				wsDesktopMgr:  desktop.NewWsSessionManager(),
 			}
 

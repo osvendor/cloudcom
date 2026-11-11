@@ -13,7 +13,7 @@ func TestStopDoesNotPanicWhenAuditLoggerUnavailable(t *testing.T) {
 	cfg := config.Default()
 	cfg.AuditEnabled = false
 
-	h := New(cfg)
+	h := newTestHeartbeatWithoutCodec(cfg)
 
 	defer func() {
 		if r := recover(); r != nil {
