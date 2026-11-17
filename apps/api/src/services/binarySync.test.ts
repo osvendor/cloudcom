@@ -1952,6 +1952,7 @@ describe("binarySync", () => {
         // name-derived value, same as before this field existed.
         platformTrust?: string;
       }[],
+      repository = "LanternOps/breeze",
     ) {
       const { publicKey, privateKey } = generateKeyPairSync("ed25519");
       const publicDer = publicKey.export({ format: "der", type: "spki" }) as Buffer;
@@ -1959,7 +1960,7 @@ describe("binarySync", () => {
       const manifest = Buffer.from(
         JSON.stringify({
           schemaVersion: 1,
-          repository: "LanternOps/breeze",
+          repository,
           release: "v1.2.3",
           assets: assets.map((a) => ({
             name: a.name,
@@ -2031,6 +2032,45 @@ describe("binarySync", () => {
       expect(manifestSigningMocks.signManifest).not.toHaveBeenCalled();
     });
 
+    it("normalizes a verified custom local manifest even with the default official source", async () => {
+      setLocalScanEnv();
+      const custom = makeOfficialLocalManifest([{ name: "breeze-agent-linux-amd64",
+        sha256: localAssetChecksum(), size: 18, edition: "self-host" }], "osvendor/cloudcom");
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = custom.publicKey;
+      mockReadFileWithOfficialManifest("0.129.5", custom.manifest, custom.signature);
+      await syncBinaries();
+      const row = dbMocks.insertValues.mock.calls[0]![0];
+      expect(row.signingKeyId).toBe("deploy-test-aaaaaaaa");
+      expect(JSON.parse(row.releaseManifest)).toMatchObject({ version: "0.129.5",
+        component: "agent", platform: "linux", arch: "amd64", checksum: localAssetChecksum(), size: 18 });
+      expect(manifestSigningMocks.signManifest).toHaveBeenCalledWith(row.releaseManifest);
+      expect(dbMocks.onConflictDoUpdate).toHaveBeenCalledWith(expect.objectContaining({
+        set: expect.objectContaining({ signingKeyId: row.signingKeyId,
+          releaseManifest: row.releaseManifest, manifestSignature: row.manifestSignature }),
+      }));
+    });
+
+    it("fails closed when signing a verified custom local asset fails", async () => {
+      setLocalScanEnv();
+      const custom = makeOfficialLocalManifest([{ name: "breeze-agent-linux-amd64",
+        sha256: localAssetChecksum(), size: 18 }], "osvendor/cloudcom");
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = custom.publicKey;
+      mockReadFileWithOfficialManifest("0.129.5", custom.manifest, custom.signature);
+      manifestSigningMocks.signManifest.mockRejectedValueOnce(new Error("deployment signing unavailable"));
+      await expect(syncBinaries()).rejects.toThrow("deployment signing unavailable");
+      expect(dbMocks.insertValues).not.toHaveBeenCalled();
+    });
+
+    it("does not normalize a custom local asset with a mismatched checksum", async () => {
+      setLocalScanEnv();
+      const custom = makeOfficialLocalManifest([{ name: "breeze-agent-linux-amd64",
+        sha256: "a".repeat(64), size: 18 }], "osvendor/cloudcom");
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = custom.publicKey;
+      mockReadFileWithOfficialManifest("0.129.5", custom.manifest, custom.signature);
+      await syncBinaries();
+      expect(manifestSigningMocks.signManifest).not.toHaveBeenCalled();
+      expect(dbMocks.insertValues).not.toHaveBeenCalled();
+    });
     it("falls back to per-deployment re-signing for an asset the official manifest doesn't cover", async () => {
       setLocalScanEnv();
       const official = makeOfficialLocalManifest([
