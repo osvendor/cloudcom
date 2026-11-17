@@ -88,6 +88,8 @@ const GOLDEN: Array<{ name: string; params: SendEmailParams; expectedFrom: strin
   { name: 'portal.password_reset', params: { ...MESSAGE, purpose: 'portal.password_reset', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'portal.access_request.approved', params: { ...MESSAGE, purpose: 'portal.access_request.approved', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'portal.access_request.declined', params: { ...MESSAGE, purpose: 'portal.access_request.declined', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
+  { name: 'portal.self_registration.verify', params: { ...MESSAGE, purpose: 'portal.self_registration.verify', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
+  { name: 'portal.self_registration.existing_account', params: { ...MESSAGE, purpose: 'portal.self_registration.existing_account', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'report.delivery', params: { ...MESSAGE, purpose: 'report.delivery', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'customer.connection_health_digest', params: { ...MESSAGE, purpose: 'customer.connection_health_digest', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'trust.access_verification', params: { ...MESSAGE, purpose: 'trust.access_verification', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
@@ -278,6 +280,22 @@ describe('named helpers carry their purpose to the transport (spec §8.1)', () =
       purpose: 'portal.invite', partnerId: PARTNER_ID, partnerName: 'Acme MSP',
     });
     expect(resendSendMock.mock.calls[0]![0].from).toBe(BRANDED_FROM);
+  });
+
+  it('sendPortalInvite offering Google (W7) keeps the partner stream, sender and subject', async () => {
+    const svc = await service();
+    const spy = vi.spyOn(svc, 'sendEmail');
+    const invite = {
+      to: 'buyer@customer.test', inviteUrl: 'https://portal.test/i', orgName: 'Contoso', partnerId: PARTNER_ID, partnerName: 'Acme MSP',
+    };
+    await svc.sendPortalInvite({ ...invite, passwordAllowed: true });
+    await svc.sendPortalInvite({
+      ...invite, microsoftUrl: 'https://portal.test/i&method=microsoft', googleUrl: 'https://portal.test/i&method=google', passwordAllowed: false,
+    });
+    const [plain, google] = spy.mock.calls.map((call) => call[0] as { purpose: string; subject: string; html: string });
+    expect(google).toMatchObject({ purpose: 'portal.invite', partnerId: PARTNER_ID, partnerName: 'Acme MSP', subject: plain!.subject });
+    expect(google!.html).toContain('Sign in with Google');
+    expect(resendSendMock.mock.calls.map((call) => call[0].from)).toEqual([BRANDED_FROM, BRANDED_FROM]);
   });
 
   it('sendPortalAccessApproved / sendPortalAccessDeclined are partner-stream sends carrying the partner', async () => {

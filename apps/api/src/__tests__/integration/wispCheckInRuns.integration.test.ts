@@ -231,7 +231,7 @@ describe('run-mode columns and the cap', () => {
     const fx = await seed();
     const { row } = await firedRunning(fx);
     expect((await listCheckIns(fx.grantId, { limit: 10 })).map((r) => r.id)).toContain(row.id);
-    expect(await cancelCheckIn(fx.grantId, row.id)).toMatchObject({ status: 'cancelled' });
+    expect(await cancelCheckIn(fx.grantId, row.id, 'user')).toMatchObject({ status: 'cancelled' });
   });
 });
 
@@ -377,11 +377,23 @@ describe('firing a run check-in', () => {
 
   runDb('any other admission skip posts "the check could not start"', async () => {
     const fx = await seed();
-    h.enqueueAssessment.mockResolvedValue({ skipped: 'no_effective_agent' });
+    h.enqueueAssessment.mockResolvedValue({ skipped: 'some_unclassified_skip' });
     const row = await scheduleRun(fx, new Date());
     await makeDue(row.id, new Date());
     expect(await fireCheckIn(row.id, new Date())).toBe('fired');
     expect((await postsFor(fx.thread.id))[0]!.body).toBe(`I couldn't check on my own: the check could not start. Run it now? ${INSTRUCTION}`);
+  });
+
+  // #11610: an agent-readiness skip names what to fix instead of the generic text.
+  runDb('a no_effective_agent skip posts "no Triage agent is switched on for this organization"', async () => {
+    const fx = await seed();
+    h.enqueueAssessment.mockResolvedValue({ skipped: 'no_effective_agent' });
+    const row = await scheduleRun(fx, new Date());
+    await makeDue(row.id, new Date());
+    expect(await fireCheckIn(row.id, new Date())).toBe('fired');
+    expect((await postsFor(fx.thread.id))[0]!.body).toBe(
+      `I couldn't check on my own: no Triage agent is switched on for this organization. Run it now? ${INSTRUCTION}`,
+    );
   });
 
   runDb('a revoked grant cancels with grant_inactive and admits nothing', async () => {
@@ -390,7 +402,7 @@ describe('firing a run check-in', () => {
     await makeDue(row.id, new Date());
     await withSystemDbAccessContext(() => db.update(wispGrants).set({ status: 'revoked', revokedAt: new Date() }).where(eq(wispGrants.id, fx.grantId)));
     expect(await fireCheckIn(row.id, new Date())).toBe('cancelled');
-    expect(await rowOf(row.id)).toMatchObject({ status: 'cancelled', cancelReason: 'grant_inactive' });
+    expect(await rowOf(row.id)).toMatchObject({ status: 'cancelled', cancelReason: 'grant_inactive', cancelledBy: 'breeze' });
     expect(h.enqueueAssessment).not.toHaveBeenCalled();
     expect(await postsFor(fx.thread.id)).toHaveLength(0);
   });
@@ -518,7 +530,7 @@ describe('posting the settled run', () => {
   runDb('a check-in the user cancelled while its run ran never posts', async () => {
     const fx = await seed();
     const { row, runId } = await firedRunning(fx);
-    await cancelCheckIn(fx.grantId, row.id);
+    await cancelCheckIn(fx.grantId, row.id, 'user');
     await setRun(runId, { status: 'completed', summary: 'Done.', finishedAt: new Date() });
     expect(await postCheckInRunResult(runId)).toBe('already');
     expect(await postsFor(fx.thread.id)).toHaveLength(0);
@@ -530,7 +542,7 @@ describe('posting the settled run', () => {
     await setRun(runId, { status: 'completed', summary: 'Done.', finishedAt: new Date() });
     await withSystemDbAccessContext(() => db.update(wispGrants).set({ status: 'revoked', revokedAt: new Date() }).where(eq(wispGrants.id, fx.grantId)));
     expect(await postCheckInRunResult(runId)).toBe('cancelled');
-    expect(await rowOf(row.id)).toMatchObject({ status: 'cancelled', cancelReason: 'grant_inactive' });
+    expect(await rowOf(row.id)).toMatchObject({ status: 'cancelled', cancelReason: 'grant_inactive', cancelledBy: 'breeze' });
     expect(await postsFor(fx.thread.id)).toHaveLength(0);
   });
 

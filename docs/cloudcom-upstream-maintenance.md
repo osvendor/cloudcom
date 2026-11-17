@@ -1,5 +1,39 @@
 # CloudCom upstream maintenance
 
+## Upstream v0.129.0 intake — candidate 0.129.5 (2026-11-17)
+
+This intake targets upstream `cdea593bbfc0bfd6dc12373b437a36ea005e67ca`
+(v0.129.0) and preserves the deployed November 12 credential, Microsoft cache,
+Exchange reuse and worker-recovery changes. These are candidate integration
+choices, not deployment or endpoint promotion. The core migration comparison
+contains 19 additive migrations and no modified existing migrations. Validate
+on an isolated database; preserve separate extension migrations and ordering.
+
+Adopt #11810 (`85b336d4d`): stronger held-connection tripwires detect outer
+transactions still holding a pool slot inside `runOutsideDbContext`; outbound
+callers use short DB phases and HTTP supports opt-in total deadlines. These do
+not replace fork prepared policy reads, EPSS batching, conditional metric writes,
+bounded historical rollups, alert successor coalescing, monitor admission or
+UniFi disconnected-collector backoff. No wholesale removal is justified.
+
+Compose upstream read-only DB readiness (#11738) with pending-probe ownership
+after caller timeout, including the new read-only probe. Adopt fenced socket
+eviction and upstream worker placement (#11526), retaining bounded startup and
+CloudCommand M365 socket-owner placement for its API-private Exchange socket and
+certificate mounts. Preserve portal result routing and revocation leases. Adopt
+Windows log noise filtering (#11739) without removing upload backoff/admission.
+
+Compose case-insensitive portal matching (#11658), role inheritance and API-key
+owner authorization with native-token, remote-only, company-gateway and denied-
+staff fallback checks. Test case-variant staff/portal identity collisions. Keep
+managed RustDesk/Web Remote functionality. The DIB capture fallback and duplicate
+remote-launch button were already superseded in 0.128, not this intake.
+
+Validate strict DB tripwires, readiness timeout ownership/read-only DB, worker
+placement/startup budgets, portal/native authorization, cached/forced M365 reads
+and native canary/direct/relay/Web Remote behavior. Preserve native baseline
+0.128.5 until separate validated promotion; release API/web as a matched pair.
+
 ## OS Companion credential structure and Microsoft capture (2026-11-12)
 
 Credentials use four types: Email, Local / Domain, Application / Cloud, and
@@ -159,18 +193,21 @@ not bypass that guard or dispatch a fleet-wide installation.
 
 ## Capacity and fleet-update safeguards (2026-10-16)
 
-Microsoft directory snapshot candidates now require a pending explicit refresh;
-remove neither that predicate nor its idle/requested-sweep regression coverage
-in `cloudCommandM365SnapshotWorker.test.ts`. Enabled connections and stale cache
-age alone must not trigger Exchange mailbox/statistics collection. Cached reads
-and explicitly requested refreshes retain their existing tenant/lease checks.
+The original explicit-only snapshot policy was superseded on November 12.
+Directory refresh targets 15 minutes and usage six hours, with two tenants
+processed sequentially per sweep, freshness/cooldown checks and tenant-bound
+leases. Directory publishes before usage; metadata-only refresh skips statistics
+and reports. Preserve manual force refresh, pre-dispatch-only busy retries and
+encrypted mailbox caches (five-minute freshness, one-hour retention). Failed
+refresh retains last-good data; writes require fresh state and invalidate epochs.
+Do not restore the old explicit-only predicate during upstream intake.
 Production also retains a Redis-persisted global concurrency of one for the
 `alert-evaluation` queue; preserve/restore that operational budget when replacing
 Redis. See the capacity guide for monitoring and recovery boundaries.
 
 The October 23 Exchange correction bounds `scripts/cloudcom/exchange-worker.py`
 to one active command and three retained tenant sessions, autonomously reaps
-60-second idle sessions, enforces hard response deadlines, and terminates
+300-second idle sessions (extended November 12), enforces hard response deadlines, and terminates
 process groups on retirement. SIGTERM drains the bounded active command.
 Preserve the Exchange overlay's one-core CPU budget, reduced CPU share and
 60-second stop grace during upstream intakes. The feature Compose regression
@@ -905,7 +942,15 @@ Follow-up candidate on production baseline `acd26a1806c7fe564888ef79be5eb0c4ae1e
 
 The same candidate adds a fixed Global Administrator role read/set operation in `packages/ext-cloud-command/src/server/admin-graph-provider.ts` and `admin-execution.ts`. Only the built-in role is selectable; it requires `RoleManagement.ReadWrite.Directory` for writes, a separate confirmation, manager authorization, tenant and connection fencing, intent/outcome audit, complete assignment inventory, sole-administrator protection, and readback. This is a high-privilege capability that remains a candidate until disposable-tenant proof and production release validation pass. It does not add an arbitrary directory role editor or change the single Connect flow; the existing enterprise application may need the optional role permission and renewed tenant consent.
 
-The Exchange worker foundation is a separate candidate under `packages/ext-cloud-command/src/server/exchange-*`, `scripts/cloudcom/exchange-*` and [the worker contract](cloudcom-microsoft-exchange-worker.md). It currently supports only bounded mailbox inventory through a private Unix socket and fixed PowerShell cmdlets. The API bridge and Connect descriptor lifecycle are attached in source, but the worker is not deployed or configured on the Lightsail host. A configured worker is reported as pending until a live capability probe succeeds. The CloudCom customization registry and CI retain the worker files, broker test, and shared directory Graph projection against upstream imports. The directory uses Graph-assigned SKU names and explicitly unavailable Exchange values until its collector is connected. No production configuration has been made for this candidate. Previous application images remain the recovery path for any future image-only rollout; a future worker deployment also needs its own service rollback and descriptor revocation plan.
+The Exchange worker is deployed through a private Unix socket and host-only
+bindings; see [the worker contract](cloudcom-microsoft-exchange-worker.md).
+November 12 recovery removed a conflicting static container address and restored
+the worker with a one-core ceiling. November 13 read-only acceptance included
+mailbox reads and full three-tenant directory/usage sync. Preserve fixed cmdlets,
+tenant/generation fencing, private mounts and independent Graph/Exchange health.
+Read acceptance does not certify mailbox writes. The 0.129.5 candidate does not
+itself deploy or reconfigure this service; retain descriptor revocation and
+matched service/application rollback artifacts.
 
 A separate `admin-auth-methods.ts` candidate adds tenant-fenced, typed Graph authentication-method inventory and explicit phone/Authenticator method removal. `admin-execution.ts` retains connection/actor fences and audit intent/outcome, and `admin-services.ts` restricts both inventory and removal to organization managers because method details are sensitive. This does not imply parity with legacy per-user MFA state, recovery-email setup, phone enrollment or re-registration; those remain missing until separately implemented and verified. The existing enterprise app may require optional `UserAuthenticationMethod.Read.All` or `UserAuthenticationMethod.ReadWrite.All` consent. No migration or live deletion was performed.
 
@@ -1270,5 +1315,24 @@ The deployed server release remains bound to source `848055c33e5e99879560ab12309
 When a subsequent server-only release advances the fork version, retain `binariesVersion: 0.128.5` until another native release is explicitly validated and promoted. Generate new source/build evidence for that server release; do not rewrite historical signatures or relabel existing images.
 
 ### Exchange session reuse and TCP setup — 2026-11-12
-The tenant-bound broker reuses authenticated PowerShell sessions for five idle minutes (previously60seconds), with no synthetic keepalive traffic. The existing three-session pool and single-command admission remain. Rotation, tenant/generation checks, expired-session cleanup and uncertain-write protection remain unchanged. Worker-only Compose tcp_syn_retries=2 bounds initial TCP retransmission; no host-wide network change, IP pinning, certificate bypass or command-deadline increase. Tests:43 broker contracts incl120sec reuse/300sec idle cleanup,3 Compose-preservation tests. Worker healthy after deployment. Live mailbox initialconnection stillprovider_unreachable; reuse is not a fix for unreachable Exchangeaddresses. No successful live warm-session claim.
+The tenant-bound broker reuses authenticated PowerShell sessions for five idle minutes (previously60seconds), with no synthetic keepalive traffic. The existing three-session pool and single-command admission remain. Rotation, tenant/generation checks, expired-session cleanup and uncertain-write protection remain unchanged. Worker-only Compose tcp_syn_retries=2 bounds initial TCP retransmission; no host-wide network change, IP pinning, certificate bypass or command-deadline increase. Tests:43 broker contracts incl120sec reuse/300sec idle cleanup,3 Compose-preservation tests. Worker healthy after deployment. The November 12 initial connection failures were historical; November 13 live reads, cached reopening, force refresh and full three-tenant sync succeeded (see acceptance below). Reuse itself does not repair unreachable provider addresses.
 Affected: scripts/cloudcom/exchange-worker.py/test.py, deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml and verifier, scripts/release/feature_compose_test.py. No database/API/endpoint format change. Rollback restores prior worker script mount and Compose sysctls together. Ordinary direct-code worker bind patch; immutable image and historical signed inventories unchanged.
+
+### Exchange and full-sync acceptance — 2026-11-13
+
+BBD delegation succeeded in about 13 seconds; reopening immediately returned the
+saved result, manual force refresh succeeded in about 6.5 seconds, and forwarding
+read in about 1.5 seconds. Audit outcomes corroborated the UI. No mailbox writes
+or service/configuration changes were performed during these checks.
+
+Normal full refresh completed directory and usage snapshots for LEASE (36
+mailboxes), OS CONSULTANTS (30) and BBD (83): 149 total. Leases released and all
+mailbox sizes were available; one OS CONSULTANTS archive statistic remained
+unavailable. Existing sequential scheduling/cooldowns took about 15 minutes.
+Across 185 five-second samples, host busy averaged 27.13% (maximum 49.62%), steal
+peaked at 0.05%, and Exchange averaged 4.47% of one core (maximum 74.47%). Worker
+throttling totaled 884 ms; API/PostgreSQL/Redis had none. API readiness remained
+202/202, mostly one or two active DB connections, briefly four, with no observed
+pool saturation. Evidence: control-plane
+`cloudcom-release-evidence/m365-full-sync-20261113.json`. These historical readings
+are not proof of acceptance/deployment of candidate 0.129.5 or all Exchange writes.

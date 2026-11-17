@@ -24,6 +24,7 @@ const flushProbeSettlement = () => new Promise<void>(resolve => setImmediate(res
 function harness(overrides: Partial<ReadinessEvaluatorOptions> = {}) {
   const state = {
     db: true,
+    dbReadOnly: false,
     redis: true,
     workers: true,
     consumerState: 'running' as ConsumerLifecycleState,
@@ -32,6 +33,7 @@ function harness(overrides: Partial<ReadinessEvaluatorOptions> = {}) {
   };
 
   const checkDb = vi.fn(async () => state.db);
+  const checkDbReadOnly = vi.fn(async () => state.dbReadOnly);
   const checkRedis = vi.fn(async () => state.redis);
   const consumer = (): ConsumerReadinessState => ({
     name: 'required-consumer-internal-name',
@@ -54,6 +56,7 @@ function harness(overrides: Partial<ReadinessEvaluatorOptions> = {}) {
 
   const evaluator = createReadinessEvaluator({
     checkDb,
+    checkDbReadOnly,
     checkRedis,
     workerRegistry,
     workersInitialized: () => true,
@@ -70,6 +73,7 @@ function harness(overrides: Partial<ReadinessEvaluatorOptions> = {}) {
     state,
     evaluator,
     checkDb,
+    checkDbReadOnly,
     checkRedis,
     workerRegistry,
     onProbeFailure,
@@ -228,6 +232,106 @@ describe('createReadinessEvaluator', () => {
     it('stays closed before consumer declarations complete', async () => {
       const { evaluator } = harness({ workersInitialized: () => false });
       expect(await evaluator.get()).toMatchObject({ ready: false, workers: false });
+    });
+  });
+
+  describe('read-only database (#11731)', () => {
+    // A provider can flip Postgres to `default_transaction_read_only = on`
+    // (storage exhaustion) while it keeps answering reads. `select 1` still
+    // succeeds, so without a separate probe readiness reported ready while
+    // every write failed with SQLSTATE 25006.
+    it('reports a reachable but read-only database as not ready, with its own reason', async () => {
+      const { state, evaluator } = harness();
+      state.dbReadOnly = true;
+
+      expect(await evaluator.get()).toMatchObject({
+        ready: false,
+        db: true,
+        dbReadOnly: true,
+        reason: 'db-read-only',
+      });
+    });
+
+    it('recovers once the database accepts writes again', async () => {
+      const { state, evaluator } = harness();
+      state.dbReadOnly = true;
+      expect(await evaluator.get()).toMatchObject({ ready: false, reason: 'db-read-only' });
+
+      state.dbReadOnly = false;
+      state.clock += 6_000;
+      expect(await evaluator.get()).toMatchObject({ ready: true, dbReadOnly: false, reason: null });
+    });
+
+    it('does not run the read-only probe when the database is unreachable', async () => {
+      const { state, evaluator, checkDbReadOnly } = harness();
+      state.db = false;
+
+      expect(await evaluator.get()).toMatchObject({ ready: false, db: false, dbReadOnly: false, reason: 'db' });
+      expect(checkDbReadOnly).not.toHaveBeenCalled();
+    });
+
+    it('treats a failed read-only probe as unknown (not read-only) and reports the failure', async () => {
+      const { evaluator, onProbeFailure, checkDbReadOnly } = harness();
+      const failure = new Error('probe exploded');
+      checkDbReadOnly.mockRejectedValueOnce(failure);
+
+      expect(await evaluator.get()).toMatchObject({ ready: true, dbReadOnly: false });
+      expect(onProbeFailure).toHaveBeenCalledWith('db-read-only', failure);
+    });
+
+    it('works without a read-only probe (worker role before wiring, older callers)', async () => {
+      const { evaluator } = harness({ checkDbReadOnly: undefined });
+      expect(await evaluator.get()).toMatchObject({ ready: true, dbReadOnly: false, reason: null });
+    });
+  });
+
+  describe('deferred binary registration (#11731)', () => {
+    it('reports a deferred binary registration without closing admission', async () => {
+      const { evaluator } = harness({ binarySyncPending: () => true });
+      expect(await evaluator.get()).toMatchObject({ ready: true, binarySyncPending: true, reason: null });
+    });
+
+    it('defaults to false when the process does not sync binaries', async () => {
+      const { evaluator } = harness();
+      expect(await evaluator.get()).toMatchObject({ binarySyncPending: false });
+    });
+
+    it('is false while draining', async () => {
+      const { state, evaluator } = harness({ binarySyncPending: () => true });
+      state.shuttingDown = true;
+      expect(await evaluator.get()).toMatchObject({ binarySyncPending: false });
+    });
+  });
+
+  describe('failure reason', () => {
+    it('names the database first when it is unreachable', async () => {
+      const { state, evaluator } = harness();
+      state.db = false;
+      state.redis = false;
+      expect((await evaluator.get()).reason).toBe('db');
+    });
+
+    it('names Redis when the database is fine and Redis is down', async () => {
+      const { state, evaluator } = harness();
+      state.redis = false;
+      expect((await evaluator.get()).reason).toBe('redis');
+    });
+
+    it('names pending workers when only the consumers are not runnable', async () => {
+      const { state, evaluator } = harness();
+      state.workers = false;
+      expect((await evaluator.get()).reason).toBe('workers-pending');
+    });
+
+    it('is null when ready', async () => {
+      const { evaluator } = harness();
+      expect((await evaluator.get()).reason).toBeNull();
+    });
+
+    it('names the drain while shutting down', async () => {
+      const { state, evaluator } = harness();
+      state.shuttingDown = true;
+      expect(await evaluator.get()).toMatchObject({ ready: false, reason: 'shutting-down', dbReadOnly: false });
     });
   });
 
@@ -398,6 +502,42 @@ describe('createReadinessEvaluator', () => {
       expect(onProbeFailure).toHaveBeenCalledTimes(1);
       expect(onProbeFailure).toHaveBeenCalledWith(name, expect.any(Error));
       expect(name === 'db' ? checkRedis : checkDb).toHaveBeenCalledTimes(4);
+    });
+
+    it('retains one timed-out read-only query across invalidation and expiry, then rechecks the database mode', async () => {
+      let release!: (readOnly: boolean) => void;
+      const pending = new Promise<boolean>(resolve => { release = resolve; });
+      const { state, evaluator, checkDb, checkDbReadOnly, onProbeFailure } = harness({ probeTimeoutMs: 5 });
+      checkDbReadOnly.mockImplementationOnce(() => pending);
+
+      for (let i = 0; i < 4; i++) {
+        if (i % 2 === 0) evaluator.invalidate();
+        else state.clock += 6_000;
+        const results = await Promise.all([evaluator.get(), evaluator.get()]);
+        // Preserve the upstream unknown-mode policy, but never queue another
+        // read-only query while the original database operation is unresolved.
+        for (const result of results) {
+          expect(result).toMatchObject({ ready: true, db: true, dbReadOnly: false, reason: null });
+        }
+      }
+      expect(checkDb).toHaveBeenCalledTimes(4);
+      expect(checkDbReadOnly).toHaveBeenCalledTimes(1);
+      expect(onProbeFailure).toHaveBeenCalledTimes(1);
+      expect(onProbeFailure).toHaveBeenCalledWith('db-read-only', expect.any(Error));
+
+      release(false);
+      await flushProbeSettlement();
+      state.dbReadOnly = true;
+      evaluator.invalidate();
+      // The settled query's old result must not replace a fresh mode check.
+      expect(await evaluator.get()).toMatchObject({ ready: false, db: true, dbReadOnly: true, reason: 'db-read-only' });
+      expect(checkDbReadOnly).toHaveBeenCalledTimes(2);
+
+      state.dbReadOnly = false;
+      state.clock += 6_000;
+      expect(await evaluator.get()).toMatchObject({ ready: true, dbReadOnly: false, reason: null });
+      expect(checkDbReadOnly).toHaveBeenCalledTimes(3);
+      expect(onProbeFailure).toHaveBeenCalledTimes(1);
     });
 
     it('releases a late-rejected raw probe without an unhandled rejection or duplicate timeout report', async () => {

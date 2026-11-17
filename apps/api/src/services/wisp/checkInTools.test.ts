@@ -44,6 +44,11 @@ vi.mock('./checkInTriggers', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./checkInTriggers')>()),
   loadTriggerSubject,
 }));
+const { runCheckInBlocker } = vi.hoisted(() => ({ runCheckInBlocker: vi.fn() }));
+vi.mock('./checkInRunReadiness', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./checkInRunReadiness')>()),
+  runCheckInBlocker,
+}));
 vi.mock('./grantAuthority', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./grantAuthority')>()),
   resolveGrantCeiling,
@@ -165,6 +170,7 @@ function fencedBody(out: string, source = 'wisp_check_ins'): string {
 beforeEach(() => {
   vi.clearAllMocks();
   resolveGrantCeiling.mockResolvedValue(ceiling);
+  runCheckInBlocker.mockResolvedValue(null);
   svc.threadForGrant.mockResolvedValue({ id: THREAD, partnerId: PARTNER });
   svc.createCheckIn.mockImplementation(async (_c: GrantCeiling, input: { dueAt: Date }) => row({ dueAt: input.dueAt }));
 });
@@ -640,6 +646,18 @@ describe('wisp check-in tools — handlers', () => {
       expect(svc.createCheckIn).not.toHaveBeenCalled();
     });
 
+    it('no Triage agent can run it → run_agent_unavailable naming the cause, nothing created; notify still schedules', async () => {
+      runCheckInBlocker.mockResolvedValueOnce('no_effective_agent');
+      const out = await json(run('schedule_check_in', { delayMinutes: 10, instruction: INSTRUCTION, mode: 'run' }));
+      expect(out).toMatchObject({ error: 'run_agent_unavailable', reason: 'no_effective_agent' });
+      expect(out.message).toContain('Triage agent');
+      expect(runCheckInBlocker).toHaveBeenCalledWith(ORG);
+      expect(svc.createCheckIn).not.toHaveBeenCalled();
+      runCheckInBlocker.mockResolvedValue('no_effective_agent');
+      await run('schedule_check_in', { delayMinutes: 10, instruction: INSTRUCTION, mode: 'notify' });
+      expect(svc.createCheckIn).toHaveBeenCalledTimes(1);
+    });
+
     it('an unknown mode is invalid input', async () => {
       expect((await json(run('schedule_check_in', { delayMinutes: 10, instruction: INSTRUCTION, mode: 'auto' }))).error).toBe('invalid_input');
       expect(svc.createCheckIn).not.toHaveBeenCalled();
@@ -669,10 +687,10 @@ describe('wisp check-in tools — handlers', () => {
     });
   });
 
-  it('cancel_check_in: cancelCheckIn(grant, id); unknown or no longer cancellable → check_in_not_found', async () => {
+  it('cancel_check_in: cancelCheckIn(grant, id, "wisp"); unknown or no longer cancellable → check_in_not_found', async () => {
     svc.cancelCheckIn.mockResolvedValueOnce(row({ status: 'cancelled', cancelledAt: new Date() }));
     expect(await run('cancel_check_in', { checkInId: CHECK_IN })).toBe(`Check-in ${CHECK_IN} cancelled.`);
-    expect(svc.cancelCheckIn).toHaveBeenLastCalledWith(GRANT, CHECK_IN);
+    expect(svc.cancelCheckIn).toHaveBeenLastCalledWith(GRANT, CHECK_IN, 'wisp');
 
     svc.cancelCheckIn.mockResolvedValueOnce(null);
     expect(await json(run('cancel_check_in', { checkInId: CHECK_IN_2 }))).toEqual({ error: 'check_in_not_found' });

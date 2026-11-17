@@ -5,6 +5,8 @@ import { promptHostTelemetrySchema } from '@breeze/shared/promptHost';
 import { redactSecretsFromOutput } from '../../services/secretRedaction';
 import { MAX_AGENT_WARRANTY_ENTITLEMENTS } from '../../services/warrantyDataSources';
 import { PG_UUID_REGEX } from '../../utils/uuid';
+import { normalizeSystemUuid } from '../../services/reinstallCandidates/systemUuid';
+import { BACKUP_SNAPSHOT_ID_MAX_LENGTH } from '../../db/schema/backupConstants';
 
 // ============================================
 // Enrollment
@@ -44,6 +46,19 @@ const productSkuField = z.string().transform((value) => {
   return trimmed && trimmed.length <= 100 ? trimmed : undefined;
 }).optional();
 
+/**
+ * `systemUuid` on enroll and on the hardware report (#8318 §7.2). Tolerant: a
+ * value of any shape never fails the request. Absent stays `undefined` (the
+ * stored value is left alone); present is normalized with the agent's rules,
+ * and a rejected value (malformed, a placeholder, not a string) becomes
+ * `null`, which is stored as NULL.
+ */
+export const systemUuidField = z
+  .unknown()
+  .optional()
+  .transform((value): string | null | undefined =>
+    value === undefined ? undefined : normalizeSystemUuid(typeof value === 'string' ? value : null));
+
 export const enrollSchema = z.object({
   enrollmentKey: z.string().min(1),
   enrollmentSecret: z.string().min(1).optional(),
@@ -69,7 +84,8 @@ export const enrollSchema = z.object({
     motherboardProduct: z.string().optional(),
     motherboardVersion: z.string().optional(),
     biosVersion: z.string().optional(),
-    gpuModel: z.string().optional()
+    gpuModel: z.string().optional(),
+    systemUuid: systemUuidField,
   }).optional(),
   networkInfo: z.array(z.object({
     name: z.string(),
@@ -795,6 +811,15 @@ export function parseRestorePointOutcome(raw: unknown): RestorePointOutcome | nu
   return classified.ok ? classified.outcome : null;
 }
 
+/**
+ * Longest command id an agent may send back. Ids the API issues are a short
+ * prefix plus a UUID; the longest agent-made id is `vault-auto-sync-` plus a
+ * snapshot id of up to BACKUP_SNAPSHOT_ID_MAX_LENGTH characters. The id becomes
+ * part of log lines, database lookups and cache keys, so a frame carrying a
+ * longer one is refused at the schema (and on the HTTP result route's path).
+ */
+export const MAX_AGENT_COMMAND_ID_LENGTH = Math.max(256, 'vault-auto-sync-'.length + BACKUP_SNAPSHOT_ID_MAX_LENGTH);
+
 export const commandResultSchema = z.object({
   status: z.enum(['completed', 'failed', 'timeout']),
   exitCode: z.number().int().optional(),
@@ -1059,6 +1084,7 @@ export const updateHardwareSchema = z.object({
   motherboardVersion: z.string().optional(),
   biosVersion: z.string().optional(),
   gpuModel: z.string().optional(),
+  systemUuid: systemUuidField,
   // #5351: kept RAW here and validated separately with
   // agentMemoryInventorySchema by the route, so an invalid memory block is
   // logged and ignored instead of 400-ing the whole hardware report.

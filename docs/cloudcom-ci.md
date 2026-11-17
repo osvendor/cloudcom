@@ -34,18 +34,30 @@ or prove the unfinished native RustDesk transport.
 
 | Group | Required validation |
 | --- | --- |
-| API runtime | Named alert, capacity, rollout, integration, authentication and Companion service tests; API bundle build |
-| Database and security | Database unit tests; disposable PostgreSQL and Redis; core migrations replayed; extension migrations replayed; real Harmony isolation/publication, prepared-query RLS, device identity and atomic rollout tests; RLS coverage and tenant export/erasure |
-| Browser Companion | Package Node behavioral tests |
+| API runtime | Named alert, capacity, rollout, integration, authentication and Companion service tests; encrypted mailbox-cache, Exchange health, credential-rebuild planning and transcript cleanup tests; API bundle build |
+| Database and security | Database unit tests; disposable PostgreSQL and Redis; core migrations replayed; extension migrations replayed; real Harmony isolation/publication, prepared-query RLS, device identity, atomic rollout and Microsoft credential-capture tests; RLS coverage and tenant export/erasure |
+| Browser Companion | Package Node behavioral tests, including credential draft completion and autosave |
 | Credentials and notes | Extension typecheck, server/import tests, browser tests and web bundle |
-| Cloud Command | Extension typecheck, server and browser suites and web bundle |
+| Cloud Command | Extension typecheck, 3CX Node tests, explicit `test:server` suite, browser suite and web bundle |
 | Web UI | Named changed UI tests and web/portal builds |
 | Shared contracts | Google delegation scope tests and consuming extension typechecks |
-| Release artifacts | Version, signed-artifact and viewer-updater tests; compose generation tests; promotion script syntax |
+| Release artifacts | Version, signed-artifact and viewer-updater tests; Exchange broker tests; compose generation tests; promotion script syntax |
 
 The Linux runner requires Docker Compose, Node/pnpm, Python 3, Bash and `zip` (the native updater packaging contract uses a real STORED archive). Missing tools fail the gate; they are not grounds to skip packaging tests.
 
 The database gate owns fixed loopback-only disposable ports and never accepts production database endpoints. It explicitly enables the opt-in real Redis, prepared-policy and device-identity tests; an unset opt-in variable must not be mistaken for a successful proof. Container teardown runs on exit. The runner stops on the first failing command, and skipped or unexecuted groups must be reported as such. Classifier tests alone prove routing, not product behavior.
+
+The credential-capture integration test runs inside that same disposable database
+gate, before teardown. It verifies independent draft commit despite an ambient
+request rollback, non-bypass RLS isolation, compare-and-swap completion and
+unknown-versus-rejected retry behavior. It does not create a Microsoft account.
+The credentials package separately covers password generation, note extraction,
+normalization and draft editing. The API cache tests and Cloud Command server
+suite cover cached Exchange reads and the scheduled snapshot contract; the
+package's plain `test` script runs 3CX tests only and is not a substitute for
+`test:server`. These registrations add coverage for the deployed credential and
+Exchange changes; a passing manifest check alone is not evidence those suites
+ran against an intake candidate.
 
 Windows acceptance is separate: validate the actual signed candidate binaries on the Windows test endpoint, including service startup/update, sign-in and locked desktop capture, Web Remote, and the managed RustDesk direct/relay paths appropriate to the change. Linux tests, bundling, structural contracts and this manifest do not establish Windows desktop or installer acceptance. Production promotion also requires the exact final commit's CI result, restored-database rehearsal, provenance and rollback checks described below.
 

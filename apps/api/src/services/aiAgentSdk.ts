@@ -80,6 +80,7 @@ import {
   type ActionIntentTransitionPatch,
 } from './actionIntents/intentService';
 import { buildActionLabel } from './actionIntents/actionLabel';
+import { argumentTicketId, nameApprovalCardTargets, resolveApprovalTicketContext } from './actionIntents/approvalCardContext';
 import { publishIntentTerminalOutbox } from './aiOperator/taskOutbox';
 import { revalidateApprovedIntentForRelease } from './actionIntents/revalidateRelease';
 import {
@@ -116,6 +117,8 @@ import { isPlatformLlmConfigured } from './llm/llmAvailability';
 import type { AiModelChoice, AiSurface } from '@breeze/shared';
 import type { ResolveFailureReason } from './aiModels/eligibility';
 import type { ModelUnavailable, ResolvedModel } from './aiModels/resolveModel';
+import { effectiveToolProfile, type ToolExposure } from './aiModels/toolExposure';
+import { chatPromptExposure } from './aiModels/sessionToolExposure';
 import { resolveSessionTurn } from './aiModels/sessionModel';
 import { resolveLiveSessionToolAuthority } from './aiSessionLiveAuthority';
 import { PRE_HOOK_THREW_REFUSAL, recordPreHookRefusal, refusalLedgerText, takeLedgeredRefusal } from './aiChatRefusalLedger';
@@ -489,6 +492,13 @@ export type PreFlightResult = {
    * env-managed offering like any other.
    */
   model: ResolvedModel;
+  /**
+   * #11395: this turn's prompt for another model the route fails over to.
+   * Returns `systemPrompt` itself when that model's chat prompt exposure is
+   * the same; otherwise rebuilds it for that model's tool profile. Optional:
+   * callers that never switch models ignore it.
+   */
+  systemPromptFor?: (model: ResolvedModel) => Promise<string>;
 } | {
   ok: false;
   error: string;
@@ -501,6 +511,11 @@ export type PreFlightResult = {
   code?: ResolveFailureReason | 'turn_limit_reached';
   /** The credit / plan gate refused the turn (status is 402): the code the client switches on. */
   billingCode?: AiDenialClientCode;
+  /**
+   * #11609: the session was closed elsewhere before this turn ran. Typed, not
+   * a message match, so the route answers a coded 410 `session_closed`.
+   */
+  sessionRefusal?: 'session_closed';
 };
 
 /**
@@ -547,6 +562,19 @@ type PreFlightSession = NonNullable<Awaited<ReturnType<typeof getSession>>>;
  * Callers that pass `inDb` must NOT also wrap this call in a context, or the
  * rate limit runs inside it again.
  */
+/**
+ * #11395: the chat tool exposure the prompt is built from, or undefined for
+ * the identity exposure (and every non-chat surface), which keeps today's
+ * prompt paths untouched. Same resolver and inputs as the chat registration
+ * (`chatPromptExposure`).
+ */
+async function chatPromptExposureFor(model: ResolvedModel): Promise<ToolExposure | undefined> {
+  if (model.surface !== 'chat' || !model.toolProfileFacts) return undefined;
+  if (effectiveToolProfile(model.toolProfileFacts, 'chat').profile === 'full') return undefined;
+  const { listChatSurfaceToolNames, chatToolDomain } = await import('./aiAgentSdkTools');
+  return chatPromptExposure(model.toolProfileFacts, { registryNames: listChatSurfaceToolNames, domainOf: chatToolDomain });
+}
+
 export async function runPreFlightChecks(
   sessionId: string,
   content: string,
@@ -637,13 +665,11 @@ async function runPreFlightAdmission(
     // below would have produced that wording lazily. Without this, the same
     // terminal state surfaced as 410 or 400 depending purely on which path
     // got there first.
-    return {
-      ok: false,
-      error:
-        session.status === 'expired'
-          ? 'Session has expired. Please start a new session.'
-          : 'Session is not active',
-    };
+    // #11609: 'closed' (ended elsewhere, e.g. DELETE /ai/sessions/:id) is worded
+    // the same way so the route can code it (410 session_closed) instead of a
+    // bare 400 the client can only show raw.
+    if (session.status === 'expired') return { ok: false, error: 'Session has expired. Please start a new session.' };
+    return { ok: false, error: 'This conversation was closed. Please start a new session.', sessionRefusal: 'session_closed' };
   }
 
   if (session.turnCount >= session.maxTurns) {
@@ -701,37 +727,70 @@ async function runPreFlightAdmission(
       });
     }
   }
-  let systemPrompt: string;
-  // Resolve the live ceiling BEFORE rebuilding a Wisp prompt: record context
-  // and the thread seed must both respect the grant, not just the caller.
-  if (sanitizedPageContext && session.wispGrantId) {
-    const { lookupWispGrant, wispSeedForSession, WispSessionUnavailableError } = await import('./wisp/chatCeiling');
-    const { resolveGrantCeiling, GrantInactiveError } = await import('./wisp/grantAuthority');
-    try {
-      const grant = await lookupWispGrant(sessionId);
-      if (!grant) throw new WispSessionUnavailableError('grant_unpinned', sessionId);
-      const ceiling = await resolveGrantCeiling(grant.grantId, grant.revisionId);
-      systemPrompt = [
-        await buildSystemPrompt(auth, sanitizedPageContext, undefined, ceiling),
-        await wispSeedForSession(grant, auth, ceiling, sanitizedPageContext, model.logicalModel),
-      ].filter(Boolean).join('\n');
-    } catch (err) {
-      if (err instanceof WispSessionUnavailableError) return { ok: false, error: err.message, status: 409 };
-      if (err instanceof GrantInactiveError && err.kind !== 'corrupt') {
-        return { ok: false, error: 'Your Wisp grant is no longer active. Start a new Wisp conversation to continue.', status: 409 };
+  // #11395 (Decision 7): a constrained chat tool exposure gets the compact
+  // prompt, rebuilt every turn (the stored prompt is the `full` one and is
+  // never overwritten), so switching back to `full` restores it byte-for-byte.
+  // Identity exposures take the unchanged paths below.
+  const buildTurnPrompt = async (
+    forModel: ResolvedModel,
+    promptExposure: ToolExposure | undefined,
+  ): Promise<{ prompt: string } | { refusal: Extract<PreFlightResult, { ok: false }> }> => {
+    // Resolve the live ceiling BEFORE rebuilding a Wisp prompt: record context
+    // and the thread seed must both respect the grant, not just the caller.
+    // #11395: a constrained exposure rebuilds every turn, page or not, so a
+    // Wisp session takes this branch then too (ceiling + thread seed, never
+    // the bare rebuild below).
+    if (session.wispGrantId && (sanitizedPageContext || promptExposure)) {
+      const { lookupWispGrant, wispSeedForSession, WispSessionUnavailableError } = await import('./wisp/chatCeiling');
+      const { resolveGrantCeiling, GrantInactiveError } = await import('./wisp/grantAuthority');
+      try {
+        const grant = await lookupWispGrant(sessionId);
+        if (!grant) throw new WispSessionUnavailableError('grant_unpinned', sessionId);
+        const ceiling = await resolveGrantCeiling(grant.grantId, grant.revisionId);
+        return {
+          prompt: [
+            promptExposure
+              ? await buildSystemPrompt(auth, sanitizedPageContext, undefined, ceiling, promptExposure)
+              : await buildSystemPrompt(auth, sanitizedPageContext, undefined, ceiling),
+            await wispSeedForSession(grant, auth, ceiling, sanitizedPageContext, forModel.logicalModel),
+          ].filter(Boolean).join('\n'),
+        };
+      } catch (err) {
+        if (err instanceof WispSessionUnavailableError) return { refusal: { ok: false, error: err.message, status: 409 } };
+        if (err instanceof GrantInactiveError && err.kind !== 'corrupt') {
+          return { refusal: { ok: false, error: 'Your Wisp grant is no longer active. Start a new Wisp conversation to continue.', status: 409 } };
+        }
+        throw err;
       }
-      throw err;
     }
-  } else {
-    systemPrompt = sanitizedPageContext
-      ? await buildSystemPrompt(auth, sanitizedPageContext)
-      : (session.systemPrompt ?? await buildSystemPrompt(auth));
-  }
+    if (promptExposure) {
+      return { prompt: await buildSystemPrompt(auth, sanitizedPageContext, undefined, undefined, promptExposure) };
+    }
+    return {
+      prompt: sanitizedPageContext
+        ? await buildSystemPrompt(auth, sanitizedPageContext)
+        : (session.systemPrompt ?? await buildSystemPrompt(auth)),
+    };
+  };
+  const promptExposure = await chatPromptExposureFor(model);
+  const built = await buildTurnPrompt(model, promptExposure);
+  if ('refusal' in built) return built.refusal;
+  const systemPrompt = built.prompt;
+  // #11395: a failover hop (routes/ai.ts) may land on an offering with another
+  // tool profile; its registration follows that model, so its prompt must too.
+  // Same prompt exposure: this turn's prompt, unchanged.
+  const systemPromptFor = async (next: ResolvedModel): Promise<string> => {
+    const nextExposure = await chatPromptExposureFor(next);
+    if ((nextExposure?.fingerprint ?? null) === (promptExposure?.fingerprint ?? null)) return systemPrompt;
+    const rebuilt = await buildTurnPrompt(next, nextExposure);
+    if ('refusal' in rebuilt) throw new Error(rebuilt.refusal.error);
+    return rebuilt.prompt;
+  };
 
   // A durable reservation is acquired immediately before provider dispatch by
   // the route. Returning an advisory remaining-budget snapshot here would
   // recreate the check-then-spend race this preflight must not authorize.
-  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, model };
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, model, systemPromptFor };
 }
 
 /**
@@ -2327,6 +2386,22 @@ function createGatedSessionPreToolUse(session: ActiveSession) {
       const description = standingConflict
         ? standingConflictDescription(standingConflict.text, contextDescription)
         : contextDescription;
+      // #11674: what the chat card shows. The guardrail headline names a
+      // ticket or a device by an id stub; the card names them by ticket number
+      // and device name (the intent service does the device half for the
+      // stored label, so `description` itself — the intent's reason — is left
+      // as is). The ticket's subject and requester ride as `ticketContext` for
+      // the card body, never in a headline. Both reads are non-fatal.
+      const cardTicketId = argumentTicketId(toolName, input as Record<string, unknown>);
+      const ticketContext = cardTicketId
+        ? await resolveApprovalTicketContext(cardTicketId, intentOrgId, callReach(session, wispCall.current))
+        : null;
+      const cardDescription = nameApprovalCardTargets(description, {
+        deviceId: deviceId ?? null,
+        deviceName: deviceContext?.displayName ?? deviceContext?.hostname ?? null,
+        ticketId: cardTicketId,
+        ticketNumber: ticketContext?.ticketNumber ?? null,
+      });
 
       if (guardrailCheck.tier >= 3) {
         // Hoisted above the try below (unlike `intent`, which stays
@@ -2466,7 +2541,7 @@ function createGatedSessionPreToolUse(session: ActiveSession) {
               executionId: approvalExec.id,
               intentId: intent.id,
               toolName,
-              description,
+              description: cardDescription,
               deviceContext,
               scriptRunContext,
               ...(scriptProposal ? { scriptProposal } : {}),
@@ -2528,8 +2603,9 @@ function createGatedSessionPreToolUse(session: ActiveSession) {
             approvalWindowMs: session.approvalWaitBudgetMs,
             toolName,
             input: pinnedCard ? pinnedCard.input : input,
-            description: pinnedCard ? pinnedCard.description : description,
+            description: pinnedCard ? pinnedCard.description : cardDescription,
             deviceContext,
+            ...(ticketContext ? { ticketContext } : {}),
             ...(standingConflict ? { standingInstructionConflict: standingConflict } : {}),
             intentBacked: true,
             // #10416: the requester can decide only an intent that fanned a
@@ -3206,8 +3282,9 @@ function createGatedSessionPreToolUse(session: ActiveSession) {
             approvalWindowMs: session.approvalWaitBudgetMs,
             toolName,
             input,
-            description,
+            description: cardDescription,
             deviceContext,
+            ...(ticketContext ? { ticketContext } : {}),
             scriptRunContext,
             ...(scriptProposal ? { scriptProposal } : {}),
             ...(standingConflict ? { standingInstructionConflict: standingConflict } : {}),

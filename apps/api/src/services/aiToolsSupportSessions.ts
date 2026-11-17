@@ -25,9 +25,10 @@ import { and, desc, eq, inArray, type SQL } from 'drizzle-orm';
 import { db } from '../db';
 import { devices, organizations, remoteSessions, supportSessions } from '../db/schema';
 import type { AuthContext } from '../middleware/auth';
+import { inToolDbPhase } from './aiToolDbContext';
 import type { AiTool } from './aiTools';
 import { mfaGatedToolError } from './aiToolMfaGate';
-import { endSupportSession } from './quickSupportEnd';
+import { endSupportSession, type EndSupportSessionResult } from './quickSupportEnd';
 import { deviceScopeCondition } from './aiToolsSiteScope';
 import { SUPPORT_SESSION_ACTIONS } from './aiToolSchemasDeviceOps';
 import { auditToolWrite, bounded, clampLimit, json, jsonError, notFound, thrown } from './aiToolsSoftwareShared';
@@ -110,10 +111,16 @@ async function views(auth: AuthContext, sessions: SessionRow[]) {
 }
 
 /** What the model should say about the client after an end (quickSupportEnd.ts: credentials are revoked either way). */
-function endNote(session: SessionRow, result: { commandDelivered: boolean; disconnect: unknown }): { note?: string } {
+function endNote(
+  session: SessionRow,
+  result: Pick<EndSupportSessionResult, 'commandDelivered' | 'disconnect'>,
+): { note?: string } {
   if (!session.deviceId) return { note: 'No client had joined this session; it is closed.' };
   if (result.disconnect === 'close-failed') {
     return { note: 'Access is revoked, but the client\'s connection did not close cleanly; it removes itself once it fails to re-authenticate.' };
+  }
+  if (result.disconnect === 'unconfirmed') {
+    return { note: 'Access is revoked, but closing the client\'s connection was not confirmed; it removes itself once it fails to re-authenticate.' };
   }
   if (!result.commandDelivered) {
     return { note: 'The client is not connected right now. Its access is already revoked; it removes itself within about 10 minutes of reconnecting.' };
@@ -125,6 +132,9 @@ export function registerSupportSessionTools(aiTools: Map<string, AiTool>): void 
   aiTools.set('manage_support_sessions', {
     tier: 1,
     domain: 'devices',
+    // Ending a session waits on the agent relay twice; no transaction may be
+    // held across it.
+    selfManagedDbContext: ['end'],
     searchHint: 'Quick Support sessions (temporary remote-support clients): list, check, end',
     definition: {
       name: 'manage_support_sessions',
@@ -151,7 +161,11 @@ export function registerSupportSessionTools(aiTools: Map<string, AiTool>): void 
           return bounded({ sessions: await views(auth, rows) });
         }
         if (typeof input.sessionId !== 'string') return jsonError('sessionId is required', 'VALIDATION_ERROR');
-        const [session] = await loadSessions(auth, eq(supportSessions.id, input.sessionId), 1);
+        const sessionId = input.sessionId;
+        // `end` manages its own DB context (it waits on the agent relay): the
+        // read runs in a short caller-scoped context; other actions join the
+        // dispatcher's.
+        const [session] = await inToolDbPhase(auth, () => loadSessions(auth, eq(supportSessions.id, sessionId), 1));
         if (!session) return notFound('Support session');
         if (action === 'get') return bounded({ session: (await views(auth, [session]))[0] });
 

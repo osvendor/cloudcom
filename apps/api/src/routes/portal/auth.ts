@@ -65,6 +65,7 @@ import { portalSessionRevokedSql, revokePortalSessionDurably } from '../../servi
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
 import { portalAccessModeAllows } from './accessMode';
 import { nativeSessionAllows, NATIVE_SESSION_PREFIX } from '../../services/portalNativeLogin';
+import { portalLoginEmailEquals, portalLoginEmailMatchIsAmbiguous } from '../../services/portalLoginEmail';
 
 export const authRoutes = new Hono();
 const ALLOW_IN_MEMORY_PORTAL_STATE = !PORTAL_USE_REDIS;
@@ -118,6 +119,10 @@ const PORTAL_AUTH_AUDIT_ACTIONS = new Map<string, string>([
   ['/auth/reset-password', 'portal.auth.password_reset.complete'],
   ['/auth/accept-invite', 'portal.auth.invite.accept'],
   ['/auth/logout', 'portal.auth.logout'],
+  // W6 (#11383, plan D12): one anonymous row per self-registration submit,
+  // whatever the outcome — the same for every address by construction. The
+  // verify route writes its own org-scoped rows.
+  ['/auth/self-register', 'portal.auth.self_register.request'],
 ]);
 
 function setPortalAuthAuditIdentity(
@@ -394,8 +399,9 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // every request with no cache (plan D1), so an org override or an inherited
   // partner default that switches password sign-in off ends a live password
   // session on its very next request, on every API instance. The same check
-  // ends an SSO session at the current `ssoSessionMaxHours` from its mint, and
-  // an entra session whose tenant is no longer the org's proven one (W4, D9).
+  // ends an SSO session at the current `ssoSessionMaxHours` from its mint, an
+  // entra session whose tenant is no longer the org's proven one (W4, D9), and
+  // a google session whose `hd` is no longer verified for the org (W7, D7).
   // Logout is exempt so a refused session can still sign out.
   //
   // No DB context is held here: the request transaction is opened only at the
@@ -532,6 +538,11 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
   // other outcome is the ordinary 401 below (W2, spec §6 invariant 8 — the
   // response never reveals that an address has more than one account). Only
   // password logins WITH browser access are candidates.
+  //
+  // The address matches case-insensitively (#11541). Two logins in one org
+  // whose addresses differ only by case are therefore both candidates; they are
+  // separate accounts with separate passwords, so the rule above still holds:
+  // the password picks the account, and a password both share is the 401.
   const userRows = await withSystemDbAccessContext(() =>
     db
       .select({
@@ -550,7 +561,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
       .from(portalUsers)
       .where(and(
         ...(orgId ? [eq(portalUsers.orgId, orgId)] : []),
-        eq(portalUsers.email, normalizedEmail),
+        portalLoginEmailEquals(normalizedEmail),
         eq(portalUsers.authMethod, 'password'),
         eq(portalUsers.browserAccess, 'granted'),
       ))
@@ -592,7 +603,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
     // than interpreting the staff endpoint's deliberately generic 401 as routing.
     const [staffIdentity] = await withSystemDbAccessContext(() => db
       .select({ id: users.id }).from(users)
-      .where(eq(users.email, normalizedEmail)).limit(1));
+      .where(sql`lower(${users.email}) = ${normalizedEmail}`).limit(1));
     if (staffIdentity) return c.json({ error: 'Invalid email or password' }, 401);
     if (user.accessMode !== 'remote_only') {
       return c.json({ error: 'This account is not enabled for remote access' }, 403);
@@ -656,7 +667,14 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
     return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
 
-  const [user] = await withSystemDbAccessContext(() =>
+  // The address matches case-insensitively (#11541). Only password logins with
+  // browser access are candidates (the token's only use is a browser sign-in),
+  // so a stale row without access neither receives a token nor blocks one.
+  // One address in several orgs keeps its existing behaviour (the first row is
+  // reset). Two candidates in ONE org whose addresses differ only by case have
+  // no principled pick, so no token is issued for the address at all; the
+  // response below is the same uniform 200.
+  const candidates = await withSystemDbAccessContext(() =>
     db
       .select({
         id: portalUsers.id,
@@ -692,11 +710,22 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
       .leftJoin(partners, eq(partners.id, organizations.partnerId))
       .where(
         orgId
-          ? and(eq(portalUsers.orgId, orgId), eq(portalUsers.email, normalizedEmail), eq(portalUsers.authMethod, 'password'))
-          : and(eq(portalUsers.email, normalizedEmail), eq(portalUsers.authMethod, 'password'))
+          ? and(eq(portalUsers.orgId, orgId), portalLoginEmailEquals(normalizedEmail), eq(portalUsers.authMethod, 'password'), eq(portalUsers.browserAccess, 'granted'))
+          : and(portalLoginEmailEquals(normalizedEmail), eq(portalUsers.authMethod, 'password'), eq(portalUsers.browserAccess, 'granted'))
       )
-      .limit(1)
+      .limit(PORTAL_LOGIN_CANDIDATE_CAP + 1)
   );
+  const ambiguous = candidates.length > PORTAL_LOGIN_CANDIDATE_CAP || portalLoginEmailMatchIsAmbiguous(candidates);
+  if (ambiguous) {
+    // Operator signal only, never in the response: the rows need cleanup.
+    // Internal ids only, never the address.
+    console.warn('[portal] password reset not issued: the address matches several logins in one org, or more than the candidate cap; every org for the address is refused', {
+      candidates: candidates.length,
+      orgIds: [...new Set(candidates.map((r) => r.orgId))],
+      portalUserIds: candidates.map((r) => r.id),
+    });
+  }
+  const user = ambiguous ? undefined : candidates[0];
 
   if (user) setPortalAuthAuditIdentity(c, user);
 
