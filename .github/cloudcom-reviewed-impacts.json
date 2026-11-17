@@ -190,7 +190,8 @@
         "apps/api/src/services/workerRegistry.ts",
         "apps/api/src/system/connections/internalEnvVars.ts",
         "apps/api/src/worker.ts",
-        "apps/api/tsup.config.ts"
+        "apps/api/tsup.config.ts",
+        "scripts/cloudcom/test-rollup-redis.sh"
       ],
       "tests": [
         "apps/api/scripts/cancel-offline-monitor-backlog.lib.test.ts",
@@ -399,6 +400,13 @@
             "build"
           ],
           "cwd": "."
+        },
+        {
+          "program": "bash",
+          "cwd": ".",
+          "args": [
+            "scripts/cloudcom/test-rollup-redis.sh"
+          ]
         }
       ]
     },
