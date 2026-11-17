@@ -1,4 +1,4 @@
-import { DelayedError, type Job } from 'bullmq';
+import { Worker } from 'bullmq';
 import { canRunBackgroundWork } from '../services/capacityGuard';
 
 /** A rollup rewrites overlapping buckets: serialize by default, including replicas. */
@@ -13,20 +13,19 @@ let lastReport = Date.now();
 
 /** Call outside a DB context. Historical windows must be retained when deferred. */
 export async function runMetricRollupWork<T>(
-  job: Pick<Job, 'moveToDelayed'> & { data: { queuedAt?: string } },
-  token: string | undefined,
+  job: { data: { queuedAt?: string } },
+  rateLimit: (durationMs: number) => Promise<void>,
   operation: () => Promise<T>,
 ): Promise<T> {
   const started = performance.now();
   let outcome: 'completed' | 'failed' | 'deferred' = 'failed';
   try {
     if (!canRunBackgroundWork()) {
-      if (!token) throw new Error('Metric rollup capacity deferral requires a worker lock token');
-      await job.moveToDelayed(Date.now() + 60_000, token);
+      // One shared cooldown, not one Redis mutation per queued window.
+      // BullMQ returns this job to waiting without consuming a failed attempt.
+      await rateLimit(60_000);
       outcome = 'deferred';
-      // Retain the exact range and day-rollup plan; do not acknowledge success,
-      // consume a failure attempt, or discard a window in favour of a newer one.
-      throw new DelayedError();
+      throw Worker.RateLimitError();
     }
     const result = await operation();
     outcome = 'completed';

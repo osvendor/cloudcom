@@ -49,8 +49,10 @@ vi.mock('bullmq', () => ({
     removeRepeatableByKey = removeRepeatableByKeyMock;
     close = closeMock;
     setGlobalConcurrency = setGlobalConcurrencyMock;
+    rateLimit = vi.fn().mockResolvedValue(undefined);
   },
   Worker: class {
+    static RateLimitError() { return new Error("bullmq:rateLimitExceeded"); }
     constructor(_name: string, processor: (job: { data: unknown }) => unknown, options: unknown) {
       workerProcessorMock.mockImplementation(processor);
       workerOptionsMock(options);
@@ -190,7 +192,7 @@ describe('metric rollups queue helpers', () => {
     const scanData = addMock.mock.calls.find(([name]) => name === 'scan-orgs')?.[1];
     expect(scanData).not.toHaveProperty('queuedAt');
     expect(setGlobalConcurrencyMock).toHaveBeenCalledWith(1);
-    expect(workerOptionsMock).toHaveBeenCalledWith(expect.objectContaining({ concurrency: 1 }));
+    expect(workerOptionsMock).toHaveBeenCalledWith(expect.objectContaining({ concurrency: 1, limiter: { max: 1, duration: 1000 } }));
   });
 
   it('retains each fixed historical window when capacity is unavailable', async () => {
@@ -204,7 +206,7 @@ describe('metric rollups queue helpers', () => {
     };
     const prior = structuredClone(data);
     await expect(workerProcessorMock({ data, moveToDelayed }, 'lock-token')).rejects.toBeInstanceOf(Error);
-    expect(moveToDelayed).toHaveBeenCalledWith(Date.now() + 60_000, 'lock-token');
+    expect(moveToDelayed).not.toHaveBeenCalled();
     expect(data).toEqual(prior);
     expect(rollupDeviceMetricsRangeMock).not.toHaveBeenCalled();
     canRunBackgroundWorkMock.mockReturnValue(true);
@@ -215,11 +217,12 @@ describe('metric rollups queue helpers', () => {
     });
   });
 
-  it('continues recording scan windows under pressure instead of silently losing history', async () => {
+  it('does not query or fan out scans under pressure', async () => {
     await initializeMetricRollupsWorker();
     canRunBackgroundWorkMock.mockReturnValue(false);
-    await workerProcessorMock({ data: { type: 'scan-orgs', lookbackMinutes: 15 } });
-    expect(addBulkMock).toHaveBeenCalledTimes(1);
+    await expect(workerProcessorMock({ data: { type: 'scan-orgs', lookbackMinutes: 15 } })).rejects.toThrow('bullmq:rateLimitExceeded');
+    expect(addBulkMock).not.toHaveBeenCalled();
+    expect(selectMock).not.toHaveBeenCalled();
     expect(rollupDeviceMetricsRangeMock).not.toHaveBeenCalled();
   });
 
@@ -280,6 +283,7 @@ describe('metric rollups queue helpers', () => {
     });
 
     expect(callOrder).toEqual([
+      'runOutsideDbContext',
       'runOutsideDbContext',
       'withSystemDbAccessContext:start',
       'withSystemDbAccessContext:end',
