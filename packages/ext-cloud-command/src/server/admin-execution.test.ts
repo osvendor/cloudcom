@@ -6,7 +6,7 @@ const actorId = '22222222-2222-4222-8222-222222222222';
 const tenantId = '33333333-3333-4333-8333-333333333333';
 const id = '44444444-4444-4444-8444-444444444444';
 const request = Object.freeze({ authenticated: true });
-function setup() {
+function setup(withCapture = true) {
   let connection: AdministrationConnection | null = {
     id, orgId, tenantId, clientId: actorId, enabled: true, generation: 1,
     credentialVersion: 'cert-1', permissionManifestVersion: 'standard-1',
@@ -20,8 +20,13 @@ function setup() {
     return Response.json({ value: [{ id, displayName: 'Fixture' }] });
   });
   const audit = vi.fn(async (_event: unknown) => {});
-  return { authorize, loadConnection, acquireToken, fetch, audit,
-    run: createAdministrationExecutor({ authorize, loadConnection, acquireToken, fetch, audit }),
+  const credentialCapture = { generatePassword: vi.fn(() => 'Maple!Fox27'),
+    prepare: vi.fn(async (_request: unknown, _input: unknown) => {}),
+    complete: vi.fn(async (_request: unknown, _input: unknown) => {}),
+    fail: vi.fn(async (_request: unknown, _input: unknown) => {}) };
+  return { authorize, loadConnection, acquireToken, fetch, audit, credentialCapture,
+    run: createAdministrationExecutor({ authorize, loadConnection, acquireToken, fetch, audit,
+      credentialCapture: withCapture ? credentialCapture : undefined }),
     change: (update: Partial<AdministrationConnection>) => { connection = { ...connection!, ...update }; },
     disconnect: () => { connection = null; },
   };
@@ -62,6 +67,68 @@ describe('organization-bound Microsoft administration execution', () => {
       expect.objectContaining({ phase: 'outcome', operation: 'group.create', outcome: 'success' }),
     ]);
     expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+  it('requires the credential capture bridge before acquiring a Microsoft token', async () => {
+    const s = setup(false);
+    await expect(s.run(request, orgId, { type: 'user.create', user: { displayName: 'New', userPrincipalName: 'new@example.test' } }))
+      .rejects.toMatchObject({ code: 'credential_capture_unavailable' });
+    expect(s.acquireToken).not.toHaveBeenCalled();
+    expect(s.fetch).not.toHaveBeenCalled();
+  });
+  it.each(['prepare', 'complete'] as const)('does not replay Microsoft creation when credential %s fails', async failure => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.credentialCapture[failure].mockRejectedValue(new Error('private database details'));
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?$select=id,verifiedDomains')) return Response.json({ value: [{ id: tenantId, verifiedDomains: [{ name: 'example.test' }] }] });
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.endsWith('/users') && init.method === 'POST') return Response.json({ id, userPrincipalName: 'new@example.test' }, { status: 201 });
+      throw new Error('Unexpected request');
+    });
+    await expect(s.run(request, orgId, { type: 'user.create', user: { displayName: 'New', userPrincipalName: 'new@example.test' } }))
+      .rejects.toMatchObject({ code: failure === 'prepare' ? 'credential_capture_unavailable' : 'unknown_write_outcome' });
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(failure === 'prepare' ? 0 : 1);
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('private database details');
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('Maple!Fox27');
+    if (failure === 'prepare') expect(s.credentialCapture.complete).not.toHaveBeenCalled();
+    if (failure === 'prepare') expect(s.credentialCapture.fail).not.toHaveBeenCalled();
+    else expect(s.credentialCapture.fail).toHaveBeenCalledWith(request, expect.objectContaining({
+      connectionId: id, tenantId, username: 'new@example.test', state: 'unknown',
+    }));
+  });
+  it.each(['rejected', 'unknown', 'capture-failure'] as const)('records %s creation without replaying its write', async mode => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
+    if (mode === 'capture-failure') s.credentialCapture.fail.mockRejectedValue(new Error('private failure'));
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?$select=id,verifiedDomains')) return Response.json({ value: [{ id: tenantId, verifiedDomains: [{ name: 'example.test' }] }] });
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.endsWith('/users') && init.method === 'POST') {
+        if (mode === 'rejected') return Response.json({ error: { code: 'Request_BadRequest' } }, { status: 400 });
+        throw new Error('network interrupted');
+      }
+      throw new Error('Unexpected request');
+    });
+    await expect(s.run(request, orgId, { type: 'user.create', user: { displayName: 'New', userPrincipalName: 'new@example.test' } }))
+      .rejects.toMatchObject({ code: mode === 'rejected' ? 'provider_rejected' : 'unknown_write_outcome' });
+    expect(s.credentialCapture.fail).toHaveBeenCalledWith(request, expect.objectContaining({
+      connectionId: id, tenantId, username: 'new@example.test', state: mode === 'rejected' ? 'rejected' : 'unknown',
+    }));
+    expect(s.credentialCapture.complete).not.toHaveBeenCalled();
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('private failure');
+  });
+  it('marks a prepared but never dispatched creation rejected when the connection fence changes', async () => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async url => url.includes('verifiedDomains')
+      ? Response.json({ value: [{ id: tenantId, verifiedDomains: [{ name: 'example.test' }] }] })
+      : Response.json({ value: [{ id: tenantId }] }));
+    s.credentialCapture.prepare.mockImplementation(async () => { s.disconnect(); });
+    await expect(s.run(request, orgId, { type: 'user.create', user: { displayName: 'New', userPrincipalName: 'new@example.test' } }))
+      .rejects.toMatchObject({ code: 'connection_changed' });
+    expect(s.credentialCapture.fail).toHaveBeenCalledWith(request, expect.objectContaining({ state: 'rejected' }));
+    expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
   });
   it('fences and audits read-only service health without dispatching writes', async () => {
     const s = setup();
@@ -116,6 +183,17 @@ describe('organization-bound Microsoft administration execution', () => {
       expect.objectContaining({ phase: 'outcome', operation: 'user.create', outcome: 'success' }),
     ]);
     expect(JSON.stringify(s.audit.mock.calls)).not.toContain((result as { temporaryPassword: string }).temporaryPassword);
+    const preparation = s.credentialCapture.prepare.mock.calls[0]![1];
+    expect(preparation).toMatchObject({ executionId: expect.any(String), connectionId: id, tenantId,
+      username: 'new@example.test', password: (result as { temporaryPassword: string }).temporaryPassword,
+      temporaryPassword: passwordOptions.forceChangePasswordNextSignIn ?? true });
+    expect(s.credentialCapture.complete).toHaveBeenCalledWith(request, {
+      executionId: (preparation as { executionId: string }).executionId,
+      connectionId: id, tenantId, username: 'new@example.test', providerUserId: id,
+    });
+    const createCall = s.fetch.mock.calls.findIndex(([url, init]) => url.endsWith('/users') && init.method === 'POST');
+    expect(s.credentialCapture.prepare.mock.invocationCallOrder[0]).toBeLessThan(s.fetch.mock.invocationCallOrder[createCall]!);
+    expect(s.credentialCapture.complete.mock.invocationCallOrder[0]).toBeGreaterThan(s.fetch.mock.invocationCallOrder[createCall]!);
     expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
   });
   it('rejects injected create properties before authorization', async () => {

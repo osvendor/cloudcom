@@ -13,6 +13,7 @@ export default defineConfig({
     // dist/worker.cjs (the compose `worker` service's `command`).
     worker: 'src/worker.ts',
     'scripts/credentials-import': 'scripts/credentials-import.ts',
+    'scripts/credentials-rebuild': 'scripts/credentials-rebuild.ts',
     'scripts/documentation-import': 'scripts/documentation-import.ts',
     'scripts/recover-stuck-agents': 'scripts/recover-stuck-agents.ts',
     // #6605: `node dist/scripts/upgrade-preflight.cjs [--strict]` — run the new

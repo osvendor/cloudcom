@@ -57,18 +57,40 @@ beforeEach(() => {
 });
 
 describe('Cloud Command Microsoft snapshot collection', () => {
-  it('does not start Exchange collection for an idle tenant without a pending explicit refresh', async () => {
+  it('selects only due tenants with cadence, cooldown and a bounded oldest-first batch', async () => {
     vi.mocked(cloudCommandAdminRuntime.configuration).mockResolvedValue(binding as never);
     vi.mocked(db.execute).mockResolvedValue([] as never);
     initializeCloudCommandM365SnapshotWorker();
     try {
       await vi.waitFor(() => expect(db.execute).toHaveBeenCalledOnce());
       const query = new PgDialect().sqlToQuery(vi.mocked(db.execute).mock.calls[0]![0] as never).sql;
-      expect(query).toMatch(/WHERE c\.enabled = true AND s\.refresh_requested_at IS NOT NULL\s+AND \(s\.last_attempt_at IS NULL OR s\.refresh_requested_at > s\.last_attempt_at\)/);
-      expect(query).not.toContain("interval '5 minutes'");
+      expect(query).toContain("interval '15 minutes'");
+      expect(query).toContain("interval '6 hours'");
+      expect(query).toContain("interval '5 minutes'");
+      expect(query).toContain("interval '1 minute'");
+      expect(query).toContain('LIMIT 2');
       expect(mocks.claim).not.toHaveBeenCalled();
       expect(mocks.provision).not.toHaveBeenCalled();
     } finally { shutdownCloudCommandM365SnapshotWorker(); }
+  });
+
+  it('skips statistics and OneDrive usage on a directory-only refresh without marking usage stale', async () => {
+    await refreshCloudCommandM365Snapshot(binding, false);
+    expect(mocks.users).toHaveBeenCalledWith({includeUsage:false});
+    expect(mocks.statistics).not.toHaveBeenCalled();expect(mocks.drives).not.toHaveBeenCalled();
+    expect(mocks.publish).toHaveBeenCalledTimes(1);
+    expect(mocks.publish.mock.calls[0]![3]).toBe('directory');
+  });
+  it('publishes directory before a slow usage collection completes', async () => {
+    let finish!: (value: unknown) => void;
+    mocks.statistics.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
+    const running=refreshCloudCommandM365Snapshot(binding);
+    await vi.waitFor(()=>expect(mocks.statistics).toHaveBeenCalledOnce(), {timeout: 2500});
+    expect(mocks.publish).toHaveBeenCalledWith(expect.anything(),binding,expect.any(String),'directory',expect.any(Object));
+    expect(mocks.release).not.toHaveBeenCalled();
+    finish({id:'mailbox-a',primarySmtpAddress:'shared@example.test',recipientType:'SharedMailbox',archiveEnabled:false,mailboxBytes:1024,archiveBytes:null,statisticsUnavailable:false,collectedAt:at});
+    await running;
+    expect(mocks.release).toHaveBeenCalledOnce();
   });
 
   it('collects and publishes a requested refresh through the existing claim and release flow', async () => {
@@ -76,7 +98,7 @@ describe('Cloud Command Microsoft snapshot collection', () => {
     vi.mocked(db.execute).mockResolvedValue([{ ...binding, id: 'connection-a' }] as never);
     initializeCloudCommandM365SnapshotWorker();
     try {
-      await vi.waitFor(() => expect(mocks.release).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(mocks.release).toHaveBeenCalledOnce(), {timeout: 2500});
       expect(mocks.claim).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding));
       expect(mocks.publish).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding), expect.any(String), 'directory', expect.objectContaining({ mailboxes: expect.any(Array) }));
       expect(mocks.publish).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding), expect.any(String), 'usage', expect.any(Object));

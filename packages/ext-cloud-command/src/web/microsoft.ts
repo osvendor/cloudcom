@@ -50,6 +50,9 @@ type GroupSettings = { groupId: string; kind: 'distribution' | 'microsoft365'; d
   primarySmtpAddress: string; requireSenderAuthenticationEnabled: boolean;
   emailAddressPolicyEnabled: boolean | null; aliases: string[] };
 type ForwardingState = { mailboxId: string; smtpAddress: string | null; keepCopy: boolean; internalRecipient: string | null };
+type MailboxCache = { checkedAt: string | null; stale: boolean; refreshing: boolean; refreshFailed?: boolean };
+type MailboxRead<T> = (T | { pending: true }) & { cache?: MailboxCache };
+type MailboxTool = 'forwarding' | 'autoReply' | 'delegationList' | 'delegation';
 type AutoReplyState = { mailboxId: string; state: 'Disabled' | 'Enabled' | 'Scheduled'; internalMessage: string; externalMessage: string;
   externalAudience: 'None' | 'Known' | 'All'; start: string | null; end: string | null };
 type AddressesState = { mailboxId: string; primarySmtpAddress: string; aliases: string[]; policyEnabled: boolean };
@@ -272,6 +275,31 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private message = '';
   private error = false;
   private generation = 0;
+  private mailboxCaches: Partial<Record<MailboxTool, MailboxCache>> = {};
+  private mailboxPolls: Partial<Record<MailboxTool, ReturnType<typeof setTimeout>>> = {};
+  private mailboxDraftDirty = { forwarding: false, autoReply: false };
+  private mailboxWriteBlocked(tool: MailboxTool): boolean { const cache = this.mailboxCaches[tool]; return Boolean(cache && (!cache.checkedAt || cache.stale || cache.refreshing || cache.refreshFailed)); }
+  private clearMailboxPolling(): void { for (const timer of Object.values(this.mailboxPolls)) clearTimeout(timer); this.mailboxPolls = {}; this.mailboxCaches = {}; }
+  private mailboxCacheText(tool: MailboxTool): string {
+    const cache = this.mailboxCaches[tool];
+    if (!cache) return '';
+    return `<p class="meta" role="status">${cache.checkedAt ? `Updated ${esc(this.formatCheckedAt(cache.checkedAt))}` : 'No saved result yet'}${cache.refreshFailed ? ' · Refresh failed; use Refresh to retry.' : cache.refreshing ? ' · Refreshing in background…' : cache.stale ? ' · Refresh to check the latest settings.' : ''}</p>`;
+  }
+  private pollMailbox(tool: MailboxTool, cache: MailboxCache | undefined, attempt: number): void {
+    clearTimeout(this.mailboxPolls[tool]);
+    if (cache) this.mailboxCaches[tool] = attempt >= 12 && cache.refreshing ? {...cache, refreshing: false, stale: true} : cache;
+    if (!cache?.refreshing || attempt >= 12) return;
+    const generation = this.generation, context = this.contextValue, id = this.detail?.id, delegateId = this.delegationSelectedId;
+    const request = this[`${tool}Request`];
+    this.mailboxPolls[tool] = setTimeout(() => {
+      const open = tool === 'delegationList' ? this.delegationOpen : this[`${tool}Open`];
+      if (!this.isConnected || !open || generation !== this.generation || context !== this.contextValue || id !== this.detail?.id || request !== this[`${tool}Request`] || (tool === 'delegation' && delegateId !== this.delegationSelectedId)) return;
+      if (tool === 'forwarding') void this.loadForwarding(false, attempt + 1);
+      else if (tool === 'autoReply') void this.loadAutoReply(false, attempt + 1);
+      else if (tool === 'delegationList') void this.loadDelegationList(false, attempt + 1);
+      else void this.loadDelegation(false, attempt + 1);
+    }, 5000);
+  }
   private busy = false;
   private resourceRequest = 0;
   private manualRefreshRequest = 0;
@@ -304,6 +332,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (context.extensionName !== 'cloudcommand')
       throw new Error('Cloud Command received the wrong extension context');
     this.contextValue = context;
+    this.clearMailboxPolling();
     this.resetForOrganization();
   }
   get context(): ExtensionPageContextV1 | null {
@@ -324,6 +353,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (this.contextValue) void this.loadConnection();
   }
   disconnectedCallback(): void {
+    this.clearMailboxPolling();
     window.removeEventListener('hashchange', this.onHashChange);
     this.generation += 1;
     this.manualRefreshRequest += 1;
@@ -784,6 +814,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.render();
   }
   private openDetail(row: ResourceRow, securityAction: UserSecurityAction | null = null, panel = 'account'): void {
+    this.clearMailboxPolling();
     this.accountPanel = securityAction ? 'security' : panel;
     this.busy = false;
     this.detail = row;
@@ -830,6 +861,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.groupNameDraft = String(row.values.displayName ?? '');
       this.render();
     }
+    else if (this.detailKind === 'user' && ['delegation', 'forwarding', 'autoreply'].includes(panel)) { this.detailRecord = { ...row.values, id: row.id }; this.render(); }
     else if (this.detailKind !== 'read') void this.loadDetailRecord(row.id, this.detailKind);
     if (this.detailKind === 'user' && !sharedMailbox && panel === 'account') void this.loadGlobalAdminStatus(row.id);
     if (this.detailKind === 'user' && panel === 'addresses' && this.mailboxInventory?.records.some(record => record.id.toLowerCase() === row.id.toLowerCase())) this.openAddresses();
@@ -1042,6 +1074,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     void this.loadMfaMethods(row.id);
   }
   private closeDetail(): void {
+    this.clearMailboxPolling();
     const id = this.returnFocus;
     this.detail = null;
     this.detailRecord = null;
@@ -1925,6 +1958,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
 
   private resetDelegation(): void {
+    delete this.mailboxCaches.delegationList; delete this.mailboxCaches.delegation;
     this.delegationRequest += 1; this.delegationOpen = false; this.delegationUsers = null; this.delegationSelectedId = ''; this.delegationRemoveRight = '';
     this.delegationListRequest += 1; this.delegationList = null; this.delegationListLoading = false; this.delegationListError = '';
     this.delegation = null; this.delegationLoading = false; this.delegationError = ''; this.delegationMessage = '';
@@ -1937,16 +1971,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.delegationOpen = true; this.delegationError = ''; this.delegationMessage = '';
     this.render(); void this.loadDelegationUsers(); void this.loadDelegationList();
   }
-  private async loadDelegationList(): Promise<void> {
+  private async loadDelegationList(forceRefresh = false, attempt = 0): Promise<void> {
     const mailboxId = this.detail?.id;
-    if (!this.delegationOpen || !mailboxId) return;
+    if (!this.delegationOpen || !mailboxId || this.delegationListLoading) return;
     const generation = this.generation; const context = this.contextValue; const request = ++this.delegationListRequest;
     this.delegationListLoading = true; this.delegationListError = ''; this.render();
     try {
-      const data = await this.request<DelegationList>(this.path('/administration'), {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.delegation.list', mailboxId }),
+      const data = await this.request<MailboxRead<DelegationList>>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.delegation.list', mailboxId, ...(forceRefresh ? {forceRefresh: true} : {}) }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationListRequest || !this.delegationOpen || this.detail?.id !== mailboxId) return;
+      this.pollMailbox('delegationList', data.cache, attempt);
+      if ('pending' in data) return;
       if (data.mailboxId !== mailboxId || !Array.isArray(data.entries)) throw new Error('Delegation inventory did not match this mailbox.');
       this.delegationList = data;
     } catch (error) {
@@ -1976,19 +2012,21 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       }
     }
   }
-  private async loadDelegation(): Promise<void> {
+  private async loadDelegation(forceRefresh = false, attempt = 0): Promise<void> {
     const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
-    if (!this.delegationOpen || !mailboxId || !delegateId || !this.delegationUsers?.items.some(row => row.id === delegateId)) return;
+    if (!this.delegationOpen || !mailboxId || !delegateId || this.delegationLoading || !this.delegationUsers?.items.some(row => row.id === delegateId)) return;
     const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
-    this.delegationLoading = true; this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.render();
+    this.delegationLoading = true; if (this.delegation?.delegateId !== delegateId) this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.render();
     try {
-      const data = await this.request<DelegationState>(this.path('/administration'), {
+      const data = await this.request<MailboxRead<DelegationState>>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'mailbox.delegation.get', mailboxId, delegateId }),
+        body: JSON.stringify({ type: 'mailbox.delegation.get', mailboxId, delegateId, ...(forceRefresh ? {forceRefresh: true} : {}) }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
+      this.pollMailbox('delegation', data.cache, attempt);
+      if ('pending' in data) return;
       if (data.mailboxId !== mailboxId || data.delegateId !== delegateId) throw new Error('Delegation identity did not match the selected users.');
-      this.delegation = data; this.delegationNeedsRefresh = false;
+      this.delegation = data; if (!data.cache?.stale) this.delegationNeedsRefresh = false;
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
       this.delegationError = error instanceof Error ? error.message : 'Could not load direct mailbox rights.';
@@ -1999,6 +2037,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }
   }
   private async setDelegation(right: 'FullAccess' | 'SendAs' | 'SendOnBehalf', enabled: boolean): Promise<void> {
+    if (this.mailboxWriteBlocked('delegation')) return;
     const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
     if (this.delegationRemoveRight && (enabled || right !== this.delegationRemoveRight)) return;
     if (!this.connection?.canManage || !this.delegationOpen || !this.delegation || !mailboxId || !delegateId ||
@@ -2013,6 +2052,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
       this.delegationNeedsRefresh = true;
       this.delegationMessage = data.verified ? 'Delegation change saved and verified. Refresh before another change.' : 'Microsoft accepted the delegation change, but readback is pending. Refresh before another change.';
+      this.pollMailbox('delegation', {checkedAt: null, stale: true, refreshing: true}, 0);
       void this.loadDelegationList();
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
@@ -2030,17 +2070,17 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const options = users.map(row => `<option value="${esc(row.id)}" ${row.id === this.delegationSelectedId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? row.values.mail ?? ''))}</option>`).join('');
     const rights = this.delegation ? ([['FullAccess', 'fullAccess', 'Full Access'], ['SendAs', 'sendAs', 'Send As'], ['SendOnBehalf', 'sendOnBehalf', 'Send on Behalf']] as const)
       .filter(([right]) => !this.delegationRemoveRight || this.delegationRemoveRight === right)
-      .map(([right, field, label]) => `<div class="user-field"><span>${label}: ${this.delegation![field] ? 'Granted' : 'Not granted'}</span>${canManage && (!this.delegationRemoveRight || this.delegation![field]) ? `<button class="secondary compact" data-delegation-right="${right}" data-delegation-enabled="${!this.delegation![field]}" ${this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}>${this.delegation![field] ? 'Remove' : 'Grant'}</button>` : ''}</div>`).join('') : '';
+      .map(([right, field, label]) => `<div class="user-field"><span>${label}: ${this.delegation![field] ? 'Granted' : 'Not granted'}</span>${canManage && (!this.delegationRemoveRight || this.delegation![field]) ? `<button class="secondary compact" data-delegation-right="${right}" data-delegation-enabled="${!this.delegation![field]}" ${this.delegationLoading || this.delegationNeedsRefresh || this.mailboxWriteBlocked('delegation') ? 'disabled' : ''}>${this.delegation![field] ? 'Remove' : 'Grant'}</button>` : ''}</div>`).join('') : '';
     const current = this.delegationList?.entries.map(entry => {
       const matches = users.filter(user => [user.values.mail, user.values.userPrincipalName].some(value => typeof value === 'string' && value.toLowerCase() === entry.delegateAddress.toLowerCase()));
       const delegateId = matches.length === 1 ? matches[0]!.id : null;
       const badges = ([['FullAccess', 'fullAccess', 'Full Access'], ['SendAs', 'sendAs', 'Send As'], ['SendOnBehalf', 'sendOnBehalf', 'Send on Behalf']] as const)
-        .filter(([, field]) => entry[field]).map(([right, , label]) => `<span class="delegate-permission">${label}${canManage && delegateId ? `<button class="secondary compact" data-delegate-remove="${esc(delegateId)}" data-remove-right="${right}" aria-label="Remove ${label} from ${esc(entry.delegateAddress)}" ${this.delegationLoading || this.delegationListLoading || this.delegationNeedsRefresh || this.delegationList?.partial ? 'disabled' : ''}>×</button>` : ''}</span>`).join('');
+        .filter(([, field]) => entry[field]).map(([right, , label]) => `<span class="delegate-permission">${label}${canManage && delegateId ? `<button class="secondary compact" data-delegate-remove="${esc(delegateId)}" data-remove-right="${right}" aria-label="Remove ${label} from ${esc(entry.delegateAddress)}" ${this.delegationLoading || this.delegationListLoading || this.delegationNeedsRefresh || this.mailboxWriteBlocked('delegationList') || this.delegationList?.partial ? 'disabled' : ''}>×</button>` : ''}</span>`).join('');
       return `<li><strong>${esc(entry.delegateAddress)}</strong><div class="delegate-permissions">${badges}</div>${canManage && !delegateId ? '<small>Cannot match this delegate to a unique tenant user.</small>' : ''}</li>`;
     }).join('') ?? '';
-    const inventory = `<section class="drawer-section"><div class="actions"><h3>Current delegates</h3><button class="secondary compact" id="delegation-list-refresh" ${this.delegationListLoading ? 'disabled' : ''}>Refresh</button></div>${this.delegationListError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationListError)}</p>` : this.delegationListLoading && !this.delegationList ? '<p class="meta">Loading current delegates…</p>' : this.delegationList ? `<ul class="delegation-current">${current || '<li>No direct delegates found.</li>'}</ul>${this.delegationList.partial ? '<p class="meta">Some permissions could not be resolved; this list may be incomplete.</p>' : ''}` : ''}</section>`;
+    const inventory = `<section class="drawer-section"><div class="actions"><h3>Current delegates</h3><button class="secondary compact" id="delegation-list-refresh" ${this.delegationListLoading ? 'disabled' : ''}>Refresh</button></div>${this.mailboxCacheText('delegationList')}${this.delegationListError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationListError)}</p>` : this.delegationListLoading && !this.delegationList ? '<p class="meta">Loading current delegates…</p>' : this.delegationList ? `<ul class="delegation-current">${current || '<li>No direct delegates found.</li>'}</ul>${this.delegationList.partial ? '<p class="meta">Some permissions could not be resolved; this list may be incomplete.</p>' : ''}` : ''}</section>`;
     const feedback = this.delegationError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationError)}</p>` : this.delegationMessage ? `<p class="status" role="status">${esc(this.delegationMessage)}</p>` : '';
-    return `<div class="delegation-panel">${inventory}${this.delegationSelectedId ? `<div class="actions"><button class="secondary compact" id="delegation-refresh" ${this.delegationLoading ? 'disabled' : ''}>Refresh selected rights</button></div>` : ''}${this.delegationUsers ? `<label>Delegate<select id="delegation-user" ${this.delegationLoading ? 'disabled' : ''}><option value="">Choose a tenant user</option>${options}</select></label>${!this.delegationUsers.complete ? '<p class="meta">This is a partial user inventory; some delegates may not appear.</p>' : ''}` : this.delegationLoading ? '<p class="meta">Loading tenant users…</p>' : ''}${this.delegationLoading && this.delegationSelectedId ? '<p class="meta">Loading direct rights…</p>' : ''}${this.delegation ? `<p class="meta">${esc(this.delegation.delegateAddress)} · Direct mailbox permissions only</p>${rights}` : ''}${feedback}</div>`;
+    return `<div class="delegation-panel">${inventory}${this.mailboxCacheText('delegation')}${this.delegationSelectedId ? `<div class="actions"><button class="secondary compact" id="delegation-refresh" ${this.delegationLoading ? 'disabled' : ''}>Refresh selected rights</button></div>` : ''}${this.delegationUsers ? `<label>Delegate<select id="delegation-user" ${this.delegationLoading ? 'disabled' : ''}><option value="">Choose a tenant user</option>${options}</select></label>${!this.delegationUsers.complete ? '<p class="meta">This is a partial user inventory; some delegates may not appear.</p>' : ''}` : this.delegationLoading ? '<p class="meta">Loading tenant users…</p>' : ''}${this.delegationLoading && this.delegationSelectedId ? '<p class="meta">Loading direct rights…</p>' : ''}${this.delegation ? `<p class="meta">${esc(this.delegation.delegateAddress)} · Direct mailbox permissions only</p>${rights}` : ''}${feedback}</div>`;
   }
   private resetAddresses(): void {
     this.addressesRequest += 1; this.addressesOpen = false; this.addresses = null;
@@ -2127,6 +2167,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
     this.resetAddresses(); this.resetDelegation();
+    this.mailboxDraftDirty.autoReply = false; delete this.mailboxCaches.autoReply; this.autoReplyLoading = false;
     this.autoReplyOpen = true; this.autoReply = null; this.autoReplyError = ''; this.autoReplyMessage = ''; this.autoReplyNeedsRefresh = false;
     this.render(); void this.loadAutoReply();
   }
@@ -2135,21 +2176,23 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? '' : new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   }
-  private async loadAutoReply(): Promise<void> {
+  private async loadAutoReply(forceRefresh = false, attempt = 0): Promise<void> {
     const mailboxId = this.detail?.id;
-    if (!this.autoReplyOpen || !mailboxId) return;
+    if (!this.autoReplyOpen || !mailboxId || this.autoReplyLoading) return;
     const generation = this.generation; const context = this.contextValue; const request = ++this.autoReplyRequest;
-    this.autoReplyLoading = true; this.autoReply = null; this.autoReplyError = ''; this.autoReplyMessage = ''; this.render();
+    this.autoReplyLoading = true; this.autoReplyError = ''; this.autoReplyMessage = ''; this.render();
     try {
-      const data = await this.request<AutoReplyState>(this.path('/administration'), {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.autoreply.get', mailboxId }),
+      const data = await this.request<MailboxRead<AutoReplyState>>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.autoreply.get', mailboxId, ...(forceRefresh ? {forceRefresh: true} : {}) }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
+      this.pollMailbox('autoReply', data.cache, attempt);
+      if ('pending' in data) return;
       if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
       this.autoReply = data;
-      this.autoReplyDraft = { state: data.state, message: data.internalMessage, externalMessage: data.externalMessage, externalAudience: data.externalAudience,
+      if (!this.mailboxDraftDirty.autoReply) this.autoReplyDraft = { state: data.state, message: data.internalMessage, externalMessage: data.externalMessage, externalAudience: data.externalAudience,
         start: this.replyLocalTime(data.start), end: this.replyLocalTime(data.end) };
-      this.autoReplyNeedsRefresh = false;
+      if (!data.cache?.stale) this.autoReplyNeedsRefresh = false;
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
       this.autoReplyError = error instanceof Error ? error.message : 'Could not load automatic replies.';
@@ -2160,6 +2203,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }
   }
   private async saveAutoReply(): Promise<void> {
+    if (this.mailboxWriteBlocked('autoReply')) return;
     const mailboxId = this.detail?.id;
     if (!this.connection?.canManage || !this.autoReplyOpen || !this.autoReply || !mailboxId || this.autoReplyLoading || this.autoReplyNeedsRefresh) return;
     const { state, message, externalMessage, externalAudience, start: localStart, end: localEnd } = this.autoReplyDraft;
@@ -2180,6 +2224,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
       this.autoReplyNeedsRefresh = true;
       this.autoReplyMessage = data.verified ? 'Automatic reply saved and verified. Refresh to make another change.' : 'Microsoft accepted the reply, but readback did not confirm it. Refresh before another change.';
+      this.mailboxDraftDirty.autoReply = false;
+      this.pollMailbox('autoReply', {checkedAt: null, stale: true, refreshing: true}, 0);
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
       this.autoReplyNeedsRefresh = true;
@@ -2195,12 +2241,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const state = this.autoReply; const busy = this.autoReplyLoading;
     const disabled = busy || !canManage || this.autoReplyNeedsRefresh;
     const feedback = this.autoReplyError ? `<p class="status" data-error="true" role="alert">${esc(this.autoReplyError)}</p>` : this.autoReplyMessage ? `<p class="status" role="status">${esc(this.autoReplyMessage)}</p>` : '';
-    const controls = state ? `<label>Status<select id="autoreply-state" ${disabled ? 'disabled' : ''}><option value="Disabled" ${this.autoReplyDraft.state === 'Disabled' ? 'selected' : ''}>Disabled</option><option value="Enabled" ${this.autoReplyDraft.state === 'Enabled' ? 'selected' : ''}>Enabled</option><option value="Scheduled" ${this.autoReplyDraft.state === 'Scheduled' ? 'selected' : ''}>Scheduled</option></select></label>${this.autoReplyDraft.state === 'Scheduled' ? `<label>Start (your time)<input id="autoreply-start" type="datetime-local" value="${esc(this.autoReplyDraft.start)}" ${disabled ? 'disabled' : ''}></label><label>End (your time)<input id="autoreply-end" type="datetime-local" value="${esc(this.autoReplyDraft.end)}" ${disabled ? 'disabled' : ''}></label>` : ''}<label>Internal reply<textarea id="autoreply-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.message)}</textarea></label><label>External reply<textarea id="autoreply-external-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.externalMessage)}</textarea></label><label>External audience<select id="autoreply-audience" ${disabled ? 'disabled' : ''}>${(['None', 'Known', 'All'] as const).map(audience => `<option value="${audience}" ${this.autoReplyDraft.externalAudience === audience ? 'selected' : ''}>${({None: 'No external replies', Known: 'Known contacts only', All: 'All external senders'})[audience]}</option>`).join('')}</select></label>${canManage ? `<button class="secondary compact" id="autoreply-save" ${disabled ? 'disabled' : ''}>Save reply</button>` : ''}` : '';
-    return `<div class="autoreply-panel"><div class="actions"><button class="secondary compact" id="autoreply-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="autoreply-close">Close</button></div>${busy ? '<p class="meta">Loading automatic replies…</p>' : controls}${feedback}</div>`;
+    const controls = state ? `<label>Status<select id="autoreply-state" ${disabled ? 'disabled' : ''}><option value="Disabled" ${this.autoReplyDraft.state === 'Disabled' ? 'selected' : ''}>Disabled</option><option value="Enabled" ${this.autoReplyDraft.state === 'Enabled' ? 'selected' : ''}>Enabled</option><option value="Scheduled" ${this.autoReplyDraft.state === 'Scheduled' ? 'selected' : ''}>Scheduled</option></select></label>${this.autoReplyDraft.state === 'Scheduled' ? `<label>Start (your time)<input id="autoreply-start" type="datetime-local" value="${esc(this.autoReplyDraft.start)}" ${disabled ? 'disabled' : ''}></label><label>End (your time)<input id="autoreply-end" type="datetime-local" value="${esc(this.autoReplyDraft.end)}" ${disabled ? 'disabled' : ''}></label>` : ''}<label>Internal reply<textarea id="autoreply-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.message)}</textarea></label><label>External reply<textarea id="autoreply-external-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.externalMessage)}</textarea></label><label>External audience<select id="autoreply-audience" ${disabled ? 'disabled' : ''}>${(['None', 'Known', 'All'] as const).map(audience => `<option value="${audience}" ${this.autoReplyDraft.externalAudience === audience ? 'selected' : ''}>${({None: 'No external replies', Known: 'Known contacts only', All: 'All external senders'})[audience]}</option>`).join('')}</select></label>${canManage ? `<button class="secondary compact" id="autoreply-save" ${disabled || this.mailboxWriteBlocked('autoReply') ? 'disabled' : ''}>Save reply</button>` : ''}` : '';
+    return `<div class="autoreply-panel"><div class="actions"><button class="secondary compact" id="autoreply-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="autoreply-close">Close</button></div>${this.mailboxCacheText('autoReply')}${busy && !state ? '<p class="meta">Loading automatic replies…</p>' : controls}${feedback}</div>`;
   }
   private openForwarding(): void {
     if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
     this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
+    this.mailboxDraftDirty.forwarding = false; delete this.mailboxCaches.forwarding; this.forwardingLoading = false;
     this.forwardingOpen = true;
     this.forwarding = null;
     this.forwardingError = '';
@@ -2209,25 +2256,26 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.render();
     void this.loadForwarding();
   }
-  private async loadForwarding(): Promise<void> {
+  private async loadForwarding(forceRefresh = false, attempt = 0): Promise<void> {
     const mailboxId = this.detail?.id;
-    if (!this.forwardingOpen || !mailboxId) return;
+    if (!this.forwardingOpen || !mailboxId || this.forwardingLoading) return;
     const generation = this.generation; const context = this.contextValue;
     const request = ++this.forwardingRequest;
-    this.forwardingLoading = true; this.forwarding = null;
+    this.forwardingLoading = true;
     this.forwardingError = ''; this.forwardingMessage = '';
     this.render();
     try {
-      const data = await this.request<ForwardingState>(this.path('/administration'), {
+      const data = await this.request<MailboxRead<ForwardingState>>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'mailbox.forwarding.get', mailboxId }),
+        body: JSON.stringify({ type: 'mailbox.forwarding.get', mailboxId, ...(forceRefresh ? {forceRefresh: true} : {}) }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
+      this.pollMailbox('forwarding', data.cache, attempt);
+      if ('pending' in data) return;
       if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
       this.forwarding = data;
-      this.forwardingAddress = data.smtpAddress ?? '';
-      this.forwardingKeepCopy = data.keepCopy;
-      this.forwardingNeedsRefresh = false;
+      if (!this.mailboxDraftDirty.forwarding) { this.forwardingAddress = data.smtpAddress ?? ''; this.forwardingKeepCopy = data.keepCopy; }
+      if (!data.cache?.stale) this.forwardingNeedsRefresh = false;
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
       this.forwardingError = error instanceof Error ? error.message : 'Could not load forwarding.';
@@ -2238,6 +2286,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }
   }
   private async saveForwarding(turnOff = false): Promise<void> {
+    if (this.mailboxWriteBlocked('forwarding')) return;
     const mailboxId = this.detail?.id;
     if (!this.connection?.canManage || !this.forwardingOpen || !this.forwarding || !mailboxId ||
       this.forwardingLoading || this.forwardingNeedsRefresh || this.forwarding.internalRecipient) return;
@@ -2257,6 +2306,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
       this.forwardingNeedsRefresh = true;
       this.forwardingMessage = data.verified ? 'Forwarding saved and verified. Refresh to make another change.' : 'Microsoft accepted the change, but readback is pending. Refresh before another change.';
+      this.mailboxDraftDirty.forwarding = false;
+      this.pollMailbox('forwarding', {checkedAt: null, stale: true, refreshing: true}, 0);
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
       this.forwardingNeedsRefresh = true;
@@ -2272,8 +2323,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const state = this.forwarding;
     const busy = this.forwardingLoading;
     const feedback = this.forwardingError ? `<p class="status" data-error="true" role="alert">${esc(this.forwardingError)}</p>` : this.forwardingMessage ? `<p class="status" role="status">${esc(this.forwardingMessage)}</p>` : '';
-    const controls = state ? `<p class="meta">Current forwarding: ${state.internalRecipient ? `internal recipient ${esc(state.internalRecipient)}` : state.smtpAddress ? esc(state.smtpAddress) : 'Off'}</p>${state.internalRecipient ? '<p class="meta">An internal forwarding recipient is configured. Change it in Exchange administration before editing SMTP forwarding here.</p>' : `<label>Forward to<input id="forwarding-address" type="email" maxlength="320" value="${esc(this.forwardingAddress)}" placeholder="person@example.com" ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}></label><label class="check"><input id="forwarding-keep-copy" type="checkbox" ${this.forwardingKeepCopy ? 'checked' : ''} ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}> Keep a copy in this mailbox</label>${canManage ? `<div class="actions"><button class="secondary compact" id="forwarding-save" ${busy || this.forwardingNeedsRefresh ? 'disabled' : ''}>Save forwarding</button><button class="secondary compact" id="forwarding-off" ${busy || this.forwardingNeedsRefresh || !state.smtpAddress ? 'disabled' : ''}>Turn off</button></div>` : ''}`}` : '';
-    return `<div class="forwarding-panel"><div class="actions"><button class="secondary compact" id="forwarding-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="forwarding-close">Close</button></div>${busy ? '<p class="meta">Loading forwarding…</p>' : controls}${feedback}<p class="meta">External forwarding may be blocked by tenant policy.</p></div>`;
+    const controls = state ? `<p class="meta">Current forwarding: ${state.internalRecipient ? `internal recipient ${esc(state.internalRecipient)}` : state.smtpAddress ? esc(state.smtpAddress) : 'Off'}</p>${state.internalRecipient ? '<p class="meta">An internal forwarding recipient is configured. Change it in Exchange administration before editing SMTP forwarding here.</p>' : `<label>Forward to<input id="forwarding-address" type="email" maxlength="320" value="${esc(this.forwardingAddress)}" placeholder="person@example.com" ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}></label><label class="check"><input id="forwarding-keep-copy" type="checkbox" ${this.forwardingKeepCopy ? 'checked' : ''} ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}> Keep a copy in this mailbox</label>${canManage ? `<div class="actions"><button class="secondary compact" id="forwarding-save" ${busy || this.forwardingNeedsRefresh || this.mailboxWriteBlocked('forwarding') ? 'disabled' : ''}>Save forwarding</button><button class="secondary compact" id="forwarding-off" ${busy || this.forwardingNeedsRefresh || this.mailboxWriteBlocked('forwarding') || !state.smtpAddress ? 'disabled' : ''}>Turn off</button></div>` : ''}`}` : '';
+    return `<div class="forwarding-panel"><div class="actions"><button class="secondary compact" id="forwarding-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="forwarding-close">Close</button></div>${this.mailboxCacheText('forwarding')}${busy && !state ? '<p class="meta">Loading forwarding…</p>' : controls}${feedback}<p class="meta">External forwarding may be blocked by tenant policy.</p></div>`;
   }
   private async loadUserLicenses(): Promise<void> {
     const id = this.detail?.id;
@@ -2977,12 +3028,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root.querySelector('#license-assign')?.addEventListener('click', () => void this.assignUserLicense());
     this.root.querySelectorAll<HTMLButtonElement>('[data-row-delegation]').forEach(button => button.addEventListener('click', () => {
       const row = this.data?.items.find(item => item.id === button.dataset.rowDelegation);
-      if (row) { this.openDetail(row); this.openDelegation(); }
+      if (row) { this.openDetail(row, null, 'delegation'); this.openDelegation(); }
     }));
     this.root.querySelector('#delegation-open')?.addEventListener('click', () => this.openDelegation());
     this.root.querySelector('#delegation-close')?.addEventListener('click', () => { this.resetDelegation(); this.render(); });
-    this.root.querySelector('#delegation-refresh')?.addEventListener('click', () => void this.loadDelegation());
-    this.root.querySelector('#delegation-list-refresh')?.addEventListener('click', () => void this.loadDelegationList());
+    this.root.querySelector('#delegation-refresh')?.addEventListener('click', () => void this.loadDelegation(true));
+    this.root.querySelector('#delegation-list-refresh')?.addEventListener('click', () => void this.loadDelegationList(true));
     this.root.querySelector<HTMLSelectElement>('#delegation-user')?.addEventListener('change', event => {
       this.delegationSelectedId = (event.target as HTMLSelectElement).value; this.delegationRemoveRight = '';
       this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.delegationNeedsRefresh = false;
@@ -2990,7 +3041,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (this.delegationSelectedId) void this.loadDelegation();
     });
     this.root.querySelectorAll<HTMLButtonElement>('[data-delegate-remove]').forEach(button => button.addEventListener('click', () => {
-      if (this.delegationLoading || this.delegationNeedsRefresh || this.delegationList?.partial) return;
+      if (this.delegationLoading || this.delegationNeedsRefresh || this.mailboxWriteBlocked('delegationList') || this.delegationList?.partial) return;
       this.delegationSelectedId = button.dataset.delegateRemove!;
       this.delegationRemoveRight = button.dataset.removeRight!;
 
@@ -3020,30 +3071,30 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-row-forwarding]').forEach(button => button.addEventListener('click', () => {
       const row = this.data?.items.find(item => item.id === button.dataset.rowForwarding);
-      if (row) { this.openDetail(row); this.openForwarding(); }
+      if (row) { this.openDetail(row, null, 'forwarding'); this.openForwarding(); }
     }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-row-autoreply]').forEach(button => button.addEventListener('click', () => {
       const row = this.data?.items.find(item => item.id === button.dataset.rowAutoreply);
-      if (row) { this.openDetail(row); this.openAutoReply(); }
+      if (row) { this.openDetail(row, null, 'autoreply'); this.openAutoReply(); }
     }));
     this.root.querySelector('#autoreply-open')?.addEventListener('click', () => this.openAutoReply());
     this.root.querySelector('#autoreply-close')?.addEventListener('click', () => { this.resetAutoReply(); this.render(); });
-    this.root.querySelector('#autoreply-refresh')?.addEventListener('click', () => void this.loadAutoReply());
+    this.root.querySelector('#autoreply-refresh')?.addEventListener('click', () => void this.loadAutoReply(true));
     this.root.querySelector<HTMLSelectElement>('#autoreply-state')?.addEventListener('change', event => {
-      this.autoReplyDraft.state = (event.target as HTMLSelectElement).value as AutoReplyState['state']; this.render();
+      this.mailboxDraftDirty.autoReply = true; this.autoReplyDraft.state = (event.target as HTMLSelectElement).value as AutoReplyState['state']; this.render();
     });
-    this.root.querySelector<HTMLSelectElement>('#autoreply-audience')?.addEventListener('change', event => { this.autoReplyDraft.externalAudience = (event.target as HTMLSelectElement).value as AutoReplyState['externalAudience']; });
+    this.root.querySelector<HTMLSelectElement>('#autoreply-audience')?.addEventListener('change', event => { this.mailboxDraftDirty.autoReply = true; this.autoReplyDraft.externalAudience = (event.target as HTMLSelectElement).value as AutoReplyState['externalAudience']; });
     for (const [selector, field] of [['#autoreply-start', 'start'], ['#autoreply-end', 'end'], ['#autoreply-message', 'message'], ['#autoreply-external-message', 'externalMessage']] as const) {
       this.root.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.addEventListener('input', event => {
-        this.autoReplyDraft[field] = (event.target as HTMLInputElement | HTMLTextAreaElement).value;
+        this.mailboxDraftDirty.autoReply = true; this.autoReplyDraft[field] = (event.target as HTMLInputElement | HTMLTextAreaElement).value;
       });
     }
     this.root.querySelector('#autoreply-save')?.addEventListener('click', () => void this.saveAutoReply());
     this.root.querySelector('#forwarding-open')?.addEventListener('click', () => this.openForwarding());
     this.root.querySelector('#forwarding-close')?.addEventListener('click', () => { this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null; this.render(); });
-    this.root.querySelector('#forwarding-refresh')?.addEventListener('click', () => void this.loadForwarding());
-    this.root.querySelector<HTMLInputElement>('#forwarding-address')?.addEventListener('input', event => { this.forwardingAddress = (event.target as HTMLInputElement).value; });
-    this.root.querySelector<HTMLInputElement>('#forwarding-keep-copy')?.addEventListener('change', event => { this.forwardingKeepCopy = (event.target as HTMLInputElement).checked; });
+    this.root.querySelector('#forwarding-refresh')?.addEventListener('click', () => void this.loadForwarding(true));
+    this.root.querySelector<HTMLInputElement>('#forwarding-address')?.addEventListener('input', event => { this.mailboxDraftDirty.forwarding = true; this.forwardingAddress = (event.target as HTMLInputElement).value; });
+    this.root.querySelector<HTMLInputElement>('#forwarding-keep-copy')?.addEventListener('change', event => { this.mailboxDraftDirty.forwarding = true; this.forwardingKeepCopy = (event.target as HTMLInputElement).checked; });
     this.root.querySelector('#forwarding-save')?.addEventListener('click', () => void this.saveForwarding());
     this.root.querySelector('#forwarding-off')?.addEventListener('click', () => void this.saveForwarding(true));
     this.root.querySelectorAll<HTMLButtonElement>('[data-user-save]').forEach(button => button.addEventListener('click', () => {

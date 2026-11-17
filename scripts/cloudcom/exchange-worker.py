@@ -14,7 +14,9 @@ MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
-IDLE_TIMEOUT_SECONDS = 60
+# Reuse the authenticated tenant session across normal navigation. This is an
+# idle lifetime, not a keepalive job: no work is generated merely to retain it.
+IDLE_TIMEOUT_SECONDS = 300
 MAX_PERSISTENT_SESSIONS = 3
 ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.statistics.get', 'mailbox.preservation.get', 'mailbox.convert.shared', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
     'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',

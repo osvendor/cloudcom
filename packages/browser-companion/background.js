@@ -19,6 +19,14 @@ async function handle(message){
   if(message.type==='selectClient'){clean();const rev=revision;await chrome.storage.session.remove('clientId');const data=await request({action:'clients'});if(rev!==revision)fail('Client changed. Try again.');if(!data.clients.some(c=>c.id===message.clientId))fail('Client unavailable');await chrome.storage.session.set({clientId:message.clientId});return {};}
   const orgId=await client(),rev=revision;
   const check=()=>{if(rev!==revision)fail('Client changed. Search again.');};
+  if(['credentialCreate','credentialUpdate'].includes(message.type)){
+    if(message.expectedOrgId!==orgId)fail('Client changed. Open the intended client again.');
+    if(message.type==='credentialCreate'&&!/^[0-9a-f-]{36}$/i.test(message.requestId||''))fail('Invalid draft request');
+    if(message.type==='credentialUpdate'&&(!/^[0-9a-f-]{36}$/i.test(message.credentialId||'')||!Number.isSafeInteger(message.version)||message.version<1))fail('Reload the credential before editing.');
+    const data=await request({action:message.type,orgId,requestId:message.requestId,category:message.category,isAdministration:message.isAdministration,credentialId:message.credentialId,version:message.version,fields:message.fields});check();
+    if(data.credential?.id){if(!vaultCache||vaultCache.orgId!==orgId)vaultCache={orgId,ids:new Set(),expires:0};vaultCache.ids.add(data.credential.id);vaultCache.expires=Date.now()+120000;}
+    return data;
+  }
   if(['notesList','notesRead','vaultList'].includes(message.type)){
     if(message.type==='notesRead'&&!/^[0-9a-f-]{36}$/i.test(message.documentId||''))fail('Note unavailable');
     const data=await request({action:message.type,orgId,query:String(message.query||'').slice(0,200),documentId:message.documentId});check();

@@ -1,7 +1,7 @@
 {
   "apiVersion": "breeze.extensions/v1",
   "name": "credentials",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "routeNamespace": "credentials",
   "requires": {
     "serverSdk": "^1.0.0",
@@ -54,7 +54,7 @@
     ]
   },
   "migrationsDir": "migrations",
-  "schemaCompatibilityFloor": "0.3.2",
+  "schemaCompatibilityFloor": "0.4.0",
   "publicRoutes": [],
   "agentRoutes": false,
   "jobs": [],
@@ -94,7 +94,13 @@
           "source_organization",
           "source_id",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "is_administration",
+          "is_draft",
+          "temporary_password",
+          "version",
+          "creation_state",
+          "provider_user_id"
         ],
         "exclude": [
           "secret_ciphertext"

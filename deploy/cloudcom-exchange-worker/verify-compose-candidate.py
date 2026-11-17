@@ -24,10 +24,12 @@ def verify(base: pathlib.Path, overlay: pathlib.Path) -> None:
     services = rendered['services']
     api = services['api']
     worker = services['cloudcom-exchange-worker']
-    if float(worker.get('cpus', 0)) != 0.25 or worker.get('cpu_shares') != 128:
+    if float(worker.get('cpus', 0)) != 1.0 or worker.get('cpu_shares') != 128:
         raise ValueError('Exchange background CPU budget must be preserved')
     if worker.get('stop_grace_period') not in ('1m0s', '60s'):
         raise ValueError('Exchange shutdown must allow bounded commands to finish')
+    if str(worker.get('sysctls', {}).get('net.ipv4.tcp_syn_retries')) != '2':
+        raise ValueError('Exchange TCP connection attempts must remain bounded')
     image = worker.get('image', '')
     if not re.fullmatch(r'cloudcom-candidate/exchange-worker@sha256:[0-9a-f]{64}', image):
         raise ValueError('Worker image must be an immutable CloudCom candidate digest')

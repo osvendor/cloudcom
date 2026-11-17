@@ -17,6 +17,38 @@ const staticGroup = { id: GROUP, securityEnabled: true, mailEnabled: false, grou
 afterEach(() => vi.useRealTimers());
 
 describe('bounded Microsoft administration provider', () => {
+  it('does not request OneDrive reports when collecting directory metadata only', async () => {
+    const token=`h.${Buffer.from(JSON.stringify({roles:['Reports.Read.All']})).toString('base64url')}.s`;
+    const fetch=vi.fn().mockResolvedValueOnce(response({value:[{id:TENANT}]}))
+      .mockResolvedValueOnce(response({value:[{id:USER,assignedLicenses:[]}]}));
+    const provider=createAdminGraphProvider({tenantId:TENANT,fetch,acquireToken:async()=>token});
+    const users=await provider.listUsers({includeUsage:false});
+    expect(users.items).toHaveLength(1);expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls.some(([url])=>String(url).includes('/reports/'))).toBe(false);
+  });
+  it('prepares a credential only after verifying its Microsoft tenant and domain, before creating the user', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test' }] }] }))
+      .mockResolvedValueOnce(response({ id: USER, userPrincipalName: 'new@example.test' }, 201));
+    const beforeCreate = vi.fn(async () => {});
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await provider.createUser({ displayName: 'New', userPrincipalName: 'new@example.test', password: 'Maple!Fox27' }, undefined, beforeCreate);
+    expect(beforeCreate).toHaveBeenCalledWith({ userPrincipalName: 'new@example.test', password: 'Maple!Fox27', forceChangePasswordNextSignIn: true });
+    expect(beforeCreate.mock.invocationCallOrder[0]).toBeGreaterThan(fetch.mock.invocationCallOrder[1]!);
+    expect(beforeCreate.mock.invocationCallOrder[0]).toBeLessThan(fetch.mock.invocationCallOrder[2]!);
+  });
+  it.each(['wrong-tenant', 'unverified-domain', 'capture-failed'])('does not create a user for %s', async mode => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: mode === 'wrong-tenant' ? USER : TENANT,
+        verifiedDomains: [{ name: mode === 'unverified-domain' ? 'other.test' : 'example.test' }] }] }));
+    const beforeCreate = vi.fn(async () => { throw new Error('capture failed'); });
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.createUser({ displayName: 'New', userPrincipalName: 'new@example.test' }, undefined, beforeCreate)).rejects.toBeTruthy();
+    expect(fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+    expect(beforeCreate).toHaveBeenCalledTimes(mode === 'capture-failed' ? 1 : 0);
+  });
   it('reads direct user memberships and marks externally managed groups read-only', async () => {
     const { fetch, provider } = harness();
     fetch.mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(response({ value: [

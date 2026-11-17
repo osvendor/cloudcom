@@ -4,11 +4,13 @@ import { bodyLimit } from 'hono/body-limit';
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { BreezeExtensionV1, ExtensionRuntimeContext, ExtensionRequestAuthorization } from '@breeze/extension-sdk';
-import { parseItGlueCsv, previewItGlue } from '../import/itGlue';
+import { parseItGlueCsv, previewItGlue, normalizeItGlue } from '../import/itGlue';
 import { seal, unseal } from './secrets';
 import { generateTotp } from './totp';
 import { createDocumentRoutes } from './documents';
 import { createBrowserCompanionRoutes } from './browserCompanion';
+import { createCredentialDraft, updateCredentialDraft, createCredentialSchema, updateCredentialSchema, credentialMetadata, CredentialDraftError, resolveCredentialEmailDefaults } from './credentialDrafts';
+export { generateCredentialPassword } from './passwordGenerator';
 
 type Auth = { user: { id: string }; partnerId: string | null; canAccessOrg(id: string): boolean };
 type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; orgId: string; actorId: string; sessionId?: string; deviceId?: string };
@@ -67,13 +69,33 @@ export function createRoutes(context: ExtensionRuntimeContext, durableAudit: Dur
   });
   const audit = (orgId: string, actorId: string, action: string, resourceId: string, details: Record<string, unknown> = {}) => durableAudit({ orgId, actorId, actorType: 'user', action: `credentials.${action}`, resourceType: 'credential', resourceId, result: 'success', details });
 
+  app.post('/orgs/:orgId/credentials', async c => {
+    if (!c.get('extensionAuthorization').hasPermission('credentials','reveal')) return c.json({ error: 'Access denied' },403);
+    const input = createCredentialSchema.safeParse(await c.req.json().catch(() => null));
+    if (!input.success) return c.json({ error: 'Invalid credential draft' },400);
+    try {
+      await audit(c.get('orgId'),c.get('actorId'),'draft.create',input.data.requestId);
+      return c.json(await createCredentialDraft(context,c.get('orgId'),c.get('actorId'),input.data));
+    } catch (e) { if(e instanceof CredentialDraftError) return c.json({error:e.message},e.status); throw e; }
+  });
+  app.patch('/orgs/:orgId/credentials/:id', async c => {
+    if (!c.get('extensionAuthorization').hasPermission('credentials','reveal')) return c.json({ error: 'Access denied' },403);
+    const id=uuid.safeParse(c.req.param('id')), input=updateCredentialSchema.safeParse(await c.req.json().catch(()=>null));
+    if(!id.success||!input.success)return c.json({error:'Invalid credential update'},400);
+    try {
+      await audit(c.get('orgId'),c.get('actorId'),'update',id.data,{fields:Object.keys(input.data.fields)});
+      return c.json(await updateCredentialDraft(context,c.get('orgId'),id.data,input.data));
+    } catch(e) { if(e instanceof CredentialDraftError)return c.json({error:e.message},e.status);throw e; }
+  });
+
   app.on('GET', ['/orgs/:orgId/credentials', '/sessions/:sessionId/credentials'], async c => {
     const query = c.req.query('q') ?? '';
     if (query.length > 200) return c.json({ error: 'Search is too long' }, 400);
     const pattern = `%${query.replace(/[\\%_]/g, '\\$&')}%`;
     const guard = c.get('sessionId') ? sql`AND EXISTS (${liveSession(c.get('sessionId')!, c.get('actorId'), c.get('orgId'), c.get('deviceId'))})` : sql``;
-    const credentials = rows(await context.db.execute(sql`SELECT id,name,category,username,email,url,has_password AS "hasPassword",has_otp AS "hasOtp" FROM credentials_records WHERE org_id=${c.get('orgId')}::uuid AND archived=false ${guard} AND (name ILIKE ${pattern} OR username ILIKE ${pattern} OR email ILIKE ${pattern} OR category ILIKE ${pattern}) ORDER BY name,id LIMIT 200`));
-    return c.json({ credentials });
+    const credentials = rows(await context.db.execute(sql`SELECT ${credentialMetadata} FROM credentials_records WHERE org_id=${c.get('orgId')}::uuid AND archived=false ${guard} AND (name ILIKE ${pattern} OR username ILIKE ${pattern} OR email ILIKE ${pattern} OR category ILIKE ${pattern}) ORDER BY is_draft DESC,name,id LIMIT 1000`));
+    const emailDefaults = c.get('sessionId') ? undefined : await resolveCredentialEmailDefaults(context, c.get('orgId'));
+    return c.json({ credentials, ...(emailDefaults ? { emailDefaults } : {}) });
   });
   for (const action of ['reveal', 'otp'] as const) {
     app.on('POST', [`/orgs/:orgId/credentials/:id/${action}`, `/sessions/:sessionId/credentials/:id/${action}`], async c => {
@@ -111,15 +133,19 @@ export function createRoutes(context: ExtensionRuntimeContext, durableAudit: Dur
       const preview = previewItGlue(imported);
       if (action === 'preview') return c.json(preview);
       if (imported.some(row => row.issues.some(issue => !['missing_username', 'missing_password'].includes(issue)))) return c.json({ error: 'Resolve invalid credential records before importing' }, 422);
+      const normalized = normalizeItGlue(imported);
+      // Reject the whole batch before encryption/writes: never silently discard
+      // standalone keys or publish them as ordinary login credentials.
+      if (normalized.some(row => row.disposition === 'note')) return c.json({ error: 'This batch contains standalone keys or secrets. Save those records in client Notes, preserving their original secret values, then remove them from this credential import and retry. No records were imported.', code: 'NOTES_REQUIRED', count: preview.normalization.notesRequired }, 422);
       const orgId = c.get('orgId');
-      const values = imported.map(row => {
+      const values = normalized.map(row => {
         const id = randomUUID();
         const encrypted = seal(context.secrets, orgId, id, { password: row.password, otpSecret: row.otpSecret, notes: row.notes });
-        return sql`(${id}::uuid,${orgId}::uuid,${row.name},${row.category},${row.username},${row.email},${row.url},${encrypted},${Boolean(row.password)},${Boolean(row.otpSecret)},${row.archived},${row.sourceOrganization},${row.sourceId})`;
+        return sql`(${id}::uuid,${orgId}::uuid,${row.name},${row.category},${row.username},${row.email},${row.url},${encrypted},${Boolean(row.password)},${Boolean(row.otpSecret)},${row.archived},${row.sourceOrganization},${row.sourceId},${row.isAdministration},${row.isDraft})`;
       });
       await audit(orgId, c.get('actorId'), 'import.requested', orgId, { count: imported.length });
       // One statement is atomic. Retries never overwrite existing credentials.
-      const inserted = rows(await context.db.execute(sql`INSERT INTO credentials_records (id,org_id,name,category,username,email,url,secret_ciphertext,has_password,has_otp,archived,source_organization,source_id) VALUES ${sql.join(values, sql`, `)} ON CONFLICT (org_id,source_organization,source_id) DO NOTHING RETURNING id`));
+      const inserted = rows(await context.db.execute(sql`INSERT INTO credentials_records (id,org_id,name,category,username,email,url,secret_ciphertext,has_password,has_otp,archived,source_organization,source_id,is_administration,is_draft) VALUES ${sql.join(values, sql`, `)} ON CONFLICT (org_id,source_organization,source_id) DO NOTHING RETURNING id`));
       await audit(orgId, c.get('actorId'), 'import.completed', orgId, { inserted: inserted.length, existing: imported.length - inserted.length });
       return c.json({ inserted: inserted.length, existing: imported.length - inserted.length });
     });

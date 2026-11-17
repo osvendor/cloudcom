@@ -18,9 +18,14 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
-    # Background Exchange sessions must not consume the interactive API's cores.
-    cpus: 0.25
+    # Bound Exchange to one core, with low scheduling priority. A quarter-core
+    # quota starves cold PowerShell/EXO startup beyond the 45-second deadline.
+    cpus: 1.0
     cpu_shares: 128
+    # Bound TCP setup for an unreachable resolved address so the client can
+    # try another address within the existing Exchange command deadline.
+    sysctls:
+      net.ipv4.tcp_syn_retries: "2"
     stop_grace_period: 60s
     tmpfs:
       - /tmp:rw,nosuid,size=64m

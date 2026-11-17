@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 test('worker permits only popup, binds client and document, and never returns secrets to popup',async()=>{
- let listener,removed,stored={companionSession:{accessToken:'ccb1.'+'t'.repeat(43),expiresAt:Date.now()+3600000}},active={id:2,url:'https://login.example.test/signin'},secretReads=0,executions=[],opened=[];
+ let listener,removed,stored={companionSession:{accessToken:'ccb1.'+'t'.repeat(43),expiresAt:Date.now()+3600000}},active={id:2,url:'https://login.example.test/signin'},secretReads=0,executions=[],opened=[],credentialWrites=[];
  const id='a'.repeat(32),org='11111111-1111-4111-8111-111111111111',credential='22222222-2222-4222-8222-222222222222';
  globalThis.chrome={runtime:{id,getURL:p=>'chrome-extension://'+id+'/'+p,onMessage:{addListener:f=>listener=f}},storage:{session:{get:async()=>stored,set:async v=>{stored={...stored,...v}},remove:async k=>{delete stored[k]},clear:async()=>{stored={}}}},tabs:{onRemoved:{addListener:f=>removed=f},query:async q=>q.active?[active]:[{id:1,url:'https://breeze.example.invalid/extensions/credentials/browser-companion'}],remove:async()=>removed(),update:async()=>{},create:async v=>{opened.push(v)}},scripting:{executeScript:async input=>{executions.push(input);return [{documentId:'document-1',result:input.args[0]==='inspect'?{ok:true,index:0,url:active.url}:{ok:true}}];}}};
  globalThis.fetch=async(url,options)=>{
@@ -11,6 +11,7 @@ test('worker permits only popup, binds client and document, and never returns se
   if(r.path.startsWith('/companion-work/'))return Response.json({item:{id:'work'}});
   if(r.path.includes('/devices?'))return Response.json({devices:[{id:'33333333-3333-4333-8333-333333333333',hostname:'Test',status:'online',osType:'windows'}],canRemote:true,canTools:true});
   if(r.path.includes('/documents'))return Response.json({documents:[]});
+  if(r.method==='POST'&&r.path.endsWith('/credentials')||r.method==='PATCH') {credentialWrites.push(r);return Response.json({credential:{id:credential,version:2},value:'generated-synthetic'});}
   if(r.path.endsWith('/reveal'))return Response.json({value:'synthetic-copy'});
   if(r.path.includes('/fill')){secretReads++;return Response.json({value:'synthetic-only'});}
   if(r.path.includes('/credentials?'))return Response.json({credentials:[{id:credential,hasPassword:true}]});
@@ -40,6 +41,14 @@ test('worker permits only popup, binds client and document, and never returns se
  assert.equal(JSON.stringify(stored).includes('synthetic-copy'),false);
  await send({type:'selectClient',clientId:org});
  assert.equal((await send({type:'copySecret',credentialId:credential,field:'password'})).ok,false);
+ assert.equal((await send({type:'credentialCreate',expectedOrgId:'other',requestId:credential,category:'Email',isAdministration:false})).ok,false);
+ assert.equal(credentialWrites.length,0);
+ assert.equal((await send({type:'credentialCreate',expectedOrgId:org,requestId:credential,category:'Email',isAdministration:false})).ok,true);
+ assert.equal(credentialWrites[0].orgId,org);assert.equal(credentialWrites[0].body.requestId,credential);
+ assert.equal((await send({type:'copySecret',credentialId:credential,field:'password'})).ok,true);
+ assert.equal((await send({type:'credentialUpdate',expectedOrgId:org,credentialId:credential,version:2,fields:{name:'Email'}})).ok,true);
+ assert.equal(credentialWrites[1].method,'PATCH');assert.equal(credentialWrites[1].body.version,2);
+ assert.equal(JSON.stringify(stored).includes('generated-synthetic'),false);
  await send({type:'devices',query:''});
  assert.equal((await send({type:'openTool',deviceId:'33333333-3333-4333-8333-333333333333',tool:'webrtc'})).ok,true);
  assert.equal(new URL(opened[0].url).searchParams.get('next'),'/remote/desktop/33333333-3333-4333-8333-333333333333');

@@ -4,9 +4,11 @@ import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { AdministrationRuntime } from './admin-runtime';
+import { invalidateDirectorySnapshot } from './directory-snapshot-store';
 import { createAdministrationStore } from './admin-store';
 import { createAdministrationExecutor, type AdministrationConnection } from './admin-execution';
 import { createExchangeMailboxInventoryService } from './exchange-services';
+import { createExchangeReadCache, type CachedExchangeOperation } from './exchange-read-cache';
 import type { MicrosoftRequest, NativeMicrosoftServices } from './native-microsoft';
 import type { GuardedFetch } from './transport';
 
@@ -26,6 +28,8 @@ export class AdministrationSetupError extends Error {
 }
 export function createAdministrationServices(context: ExtensionRuntimeContext, fetch: GuardedFetch, runtime: AdministrationRuntime): NativeMicrosoftServices {
   const store = createAdministrationStore(context);
+  const readCache = runtime.targetedReadCache ? createExchangeReadCache(runtime.targetedReadCache) : null;
+  const loadScoped = (request: MicrosoftRequest, orgId: string) => runtime.targetedReadCache ? runtime.targetedReadCache.withRequestDb(request, () => store.load(orgId)) : store.load(orgId);
   async function authorize(request: MicrosoftRequest, mutation: boolean) {
     const principal = await runtime.authorize(request, request.orgId, mutation);
     if (!principal) throw new AdministrationSetupError('access_denied');
@@ -42,6 +46,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       resourceId: request.orgId, details, result: 'success' });
   }
   const execute = createAdministrationExecutor<MicrosoftRequest>({
+    credentialCapture: runtime.credentialCapture,
     authorize: (request, orgId, operation) => runtime.authorize(request, orgId,
       operation === 'user.create' || operation === 'user.license.assign' || operation === 'user.license.remove' || operation === 'user.update' || operation === 'user.password.reset'
       || operation === 'group.create' || operation === 'group.update'
@@ -63,18 +68,18 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
   });
   const mailboxInventory = z.object({ type: z.literal('mailbox.inventory'), pageSize: z.number().int().min(1).max(200).optional() }).strict();
   const mailboxStatisticsGet = z.object({ type: z.literal('mailbox.statistics.get'), mailboxId: z.string().uuid() }).strict();
-  const forwardingGet = z.object({ type: z.literal('mailbox.forwarding.get'), mailboxId: uuid }).strict();
+  const forwardingGet = z.object({ type: z.literal('mailbox.forwarding.get'), mailboxId: uuid, forceRefresh: z.boolean().optional() }).strict();
   const forwardingSet = z.object({ type: z.literal('mailbox.forwarding.set'), mailboxId: uuid,
     smtpAddress: z.string().email().max(320).nullable(), keepCopy: z.boolean() }).strict();
-  const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid }).strict();
+  const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid, forceRefresh: z.boolean().optional() }).strict();
   const autoReplySet = z.object({ type: z.literal('mailbox.autoreply.set'), mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']),
     message: z.string().max(8192), externalMessage: z.string().max(8192).optional(), externalAudience: z.enum(['None', 'Known', 'All']).optional(), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
   const addressesGet = z.object({ type: z.literal('mailbox.addresses.get'), mailboxId: uuid }).strict();
   const primarySet = z.object({ type: z.literal('mailbox.primary.set'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
   const aliasAdd = z.object({ type: z.literal('mailbox.alias.add'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
   const aliasRemove = z.object({ type: z.literal('mailbox.alias.remove'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
-  const delegationGet = z.object({ type: z.literal('mailbox.delegation.get'), mailboxId: uuid, delegateId: uuid }).strict();
-  const delegationList = z.object({ type: z.literal('mailbox.delegation.list'), mailboxId: uuid }).strict();
+  const delegationGet = z.object({ type: z.literal('mailbox.delegation.get'), mailboxId: uuid, delegateId: uuid, forceRefresh: z.boolean().optional() }).strict();
+  const delegationList = z.object({ type: z.literal('mailbox.delegation.list'), mailboxId: uuid, forceRefresh: z.boolean().optional() }).strict();
   const delegationSet = z.object({ type: z.literal('mailbox.delegation.set'), mailboxId: uuid, delegateId: uuid,
     right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict();
   const distributionCreate = z.object({ type: z.literal('distribution.create'), name: z.string().trim().min(1).max(256),
@@ -102,7 +107,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
     return createExchangeMailboxInventoryService<MicrosoftRequest>({
       authorize: async (request, organizationId, mutation) => runtime.authorize(request, organizationId, mutation === true),
       loadConnection: async (_request, organizationId) => {
-        const row = await store.load(organizationId);
+        const row = await loadScoped(_request, organizationId);
         if (!row) return null;
         const { tenantName: _tenantName, verifiedAt: _verifiedAt, ...value } = row;
         return value;
@@ -111,6 +116,39 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       audit: event => runtime.audit({ orgId: event.organizationId, actorId: event.actorId, action: event.action,
         resourceId: event.details.connectionId as string ?? event.organizationId, details: event.details, result: event.result }),
     });
+  }
+  async function cachedRead(request: MicrosoftRequest, operation: CachedExchangeOperation, mailboxId: string, delegateId: string | undefined, force: boolean | undefined, refresh: () => Promise<unknown>) {
+    if (!readCache) return refresh();
+    const principal = await authorize(request, false);
+    const binding = await loadScoped(request, request.orgId);
+    if (!binding?.enabled || binding.orgId !== request.orgId) throw new AdministrationSetupError('connection_not_ready');
+    const result = await readCache.read(request, binding, operation, mailboxId, delegateId, force === true, async () => {
+      const current = await loadScoped(request, request.orgId);
+      if (!current?.enabled || current.id !== binding.id || current.tenantId !== binding.tenantId || current.generation !== binding.generation || current.clientId !== binding.clientId || current.credentialVersion !== binding.credentialVersion || current.permissionManifestVersion !== binding.permissionManifestVersion) throw new AdministrationSetupError('connection_changed');
+      return refresh();
+    });
+    const after = await loadScoped(request, request.orgId), actor = await authorize(request, false);
+    if (actor.actorId !== principal.actorId || !after?.enabled || after.id !== binding.id || after.tenantId !== binding.tenantId || after.clientId !== binding.clientId || after.generation !== binding.generation || after.credentialVersion !== binding.credentialVersion || after.permissionManifestVersion !== binding.permissionManifestVersion)
+      throw new AdministrationSetupError('connection_changed');
+    return result;
+  }
+  async function invalidateMailbox(request: MicrosoftRequest, mailboxId: string) {
+    if (!readCache) return;
+    await authorize(request, true);
+    const binding = await loadScoped(request, request.orgId);
+    if (!binding?.enabled || binding.orgId !== request.orgId) throw new AdministrationSetupError('connection_not_ready');
+    await readCache.invalidate(binding, mailboxId);
+  }
+  async function mutateMailbox(request: MicrosoftRequest, mailboxId: string, operation: CachedExchangeOperation, mutate: () => Promise<unknown>, refresh: () => Promise<unknown>) {
+    if (!readCache) return mutate();
+    await invalidateMailbox(request, mailboxId);
+    let result: unknown;
+    try { result = await mutate(); }
+    finally { try { await invalidateMailbox(request, mailboxId); } catch { /* initial epoch already invalidated; do not mask a write outcome */ } }
+    // The mutation's own verified readback remains authoritative. Cache refresh
+    // is read-only and must never turn a completed write into a retryable error.
+    try { await cachedRead(request, operation, mailboxId, undefined, true, refresh); } catch { /* next read retries */ }
+    return result;
   }
   async function probe(connection: Pick<AdministrationConnection, 'tenantId' | 'clientId' | 'credentialVersion'>) {
     const token = await runtime.acquireToken(connection);
@@ -234,18 +272,18 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         const readStatistics = mailboxStatisticsGet.safeParse(input);
         if (readStatistics.success) return (await exchangeService()).statisticsGet(request, request.orgId, readStatistics.data.mailboxId);
         const readForwarding = forwardingGet.safeParse(input);
-        if (readForwarding.success) return (await exchangeService()).forwardingGet(request, request.orgId, readForwarding.data.mailboxId);
+        if (readForwarding.success) return cachedRead(request, 'mailbox.forwarding.get', readForwarding.data.mailboxId, undefined, readForwarding.data.forceRefresh, async () => (await exchangeService()).forwardingGet(request, request.orgId, readForwarding.data.mailboxId));
         const saveForwarding = forwardingSet.safeParse(input);
         if (saveForwarding.success) {
           const { type: _type, ...parameters } = saveForwarding.data;
-          return (await exchangeService()).forwardingSet(request, request.orgId, parameters);
+          return mutateMailbox(request, parameters.mailboxId, 'mailbox.forwarding.get', async () => (await exchangeService()).forwardingSet(request, request.orgId, parameters), async () => (await exchangeService()).forwardingGet(request, request.orgId, parameters.mailboxId));
         }
         const readAutoReply = autoReplyGet.safeParse(input);
-        if (readAutoReply.success) return (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId);
+        if (readAutoReply.success) return cachedRead(request, 'mailbox.autoreply.get', readAutoReply.data.mailboxId, undefined, readAutoReply.data.forceRefresh, async () => (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId));
         const saveAutoReply = autoReplySet.safeParse(input);
         if (saveAutoReply.success) {
           const { type: _type, ...parameters } = saveAutoReply.data;
-          return (await exchangeService()).autoReplySet(request, request.orgId, parameters);
+          return mutateMailbox(request, parameters.mailboxId, 'mailbox.autoreply.get', async () => (await exchangeService()).autoReplySet(request, request.orgId, parameters), async () => (await exchangeService()).autoReplyGet(request, request.orgId, parameters.mailboxId));
         }
         const readAddresses = addressesGet.safeParse(input);
         if (readAddresses.success) return (await exchangeService()).addressesGet(request, request.orgId, readAddresses.data.mailboxId);
@@ -257,13 +295,13 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
           }
         }
         const readDelegation = delegationGet.safeParse(input);
-        if (readDelegation.success) return (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId);
+        if (readDelegation.success) return cachedRead(request, 'mailbox.delegation.get', readDelegation.data.mailboxId, readDelegation.data.delegateId, readDelegation.data.forceRefresh, async () => (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId));
         const listDelegation = delegationList.safeParse(input);
-        if (listDelegation.success) return (await exchangeService()).delegationList(request, request.orgId, listDelegation.data.mailboxId);
+        if (listDelegation.success) return cachedRead(request, 'mailbox.delegation.list', listDelegation.data.mailboxId, undefined, listDelegation.data.forceRefresh, async () => (await exchangeService()).delegationList(request, request.orgId, listDelegation.data.mailboxId));
         const saveDelegation = delegationSet.safeParse(input);
         if (saveDelegation.success) {
           const { type: _type, ...parameters } = saveDelegation.data;
-          return (await exchangeService()).delegationSet(request, request.orgId, parameters);
+          return mutateMailbox(request, parameters.mailboxId, 'mailbox.delegation.list', async () => (await exchangeService()).delegationSet(request, request.orgId, parameters), async () => (await exchangeService()).delegationList(request, request.orgId, parameters.mailboxId));
         }
         const createDistribution = distributionCreate.safeParse(input);
         if (createDistribution.success) return (await exchangeService()).distributionCreate(request, request.orgId,
@@ -321,6 +359,27 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         return { success: true };
       },
     },
+  };
+  const directoryMutations = new Set([
+    'user.create', 'user.license.assign', 'user.license.remove', 'group.create', 'group.update',
+    'user.update', 'user.password.reset', 'user.sessions.revoke', 'user.mfa.method.remove',
+    'user.mfa.recoveryEmail.set', 'user.mfa.mobilePhone.set', 'user.globalAdmin.set',
+    'group.member.add', 'group.member.remove', 'group.owner.add', 'group.owner.remove',
+    'mailbox.forwarding.set', 'mailbox.autoreply.set', 'mailbox.primary.set', 'mailbox.alias.add',
+    'mailbox.alias.remove', 'mailbox.delegation.set', 'distribution.create', 'shared.create',
+    'distribution.member.set', 'group.external.set', 'distribution.name.set', 'group.primary.set', 'quarantine.release.set',
+  ]);
+  const executeOperation = services.administration!.execute;
+  services.administration!.execute = async (request, input) => {
+    const result = await executeOperation(request, input);
+    if (typeof input === 'object' && input !== null && 'type' in input && typeof input.type === 'string' && directoryMutations.has(input.type) && !(typeof result === 'object' && result !== null && 'accepted' in result && result.accepted === false) && runtime.targetedReadCache) {
+      // Fresh authorized transaction keeps invalidation failures out of the
+      // accepted write transaction and prevents accidental write retries.
+      try {
+        await runtime.targetedReadCache.withRequestDb(request, () => invalidateDirectorySnapshot(context.db, request.orgId));
+      } catch { console.warn('[CloudCommand] Directory snapshot invalidation failed; scheduled refresh will retry'); }
+    }
+    return result;
   };
   return services;
 }

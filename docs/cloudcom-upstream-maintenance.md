@@ -1,5 +1,38 @@
 # CloudCom upstream maintenance
 
+## OS Companion credential structure and Microsoft capture (2026-11-12)
+
+Credentials use four types: Email, Local / Domain, Application / Cloud, and
+Network / Wi-Fi. A separate administration flag splits user accounts from
+client/tenant administration. Preserve this distinction in future upstream
+merges; vendor names are concise labels, not additional credential types.
+Standalone API, license, recovery and uninstall keys belong in encrypted Notes.
+
+The extension's additive 0004 migration includes encrypted draft metadata,
+optimistic versioning and Microsoft creation state; all new columns are included
+in the extension export policy. Existing row-bound encryption and forced org RLS
+remain authoritative. New passwords use two randomly selected words, two digits
+and one special character within twelve characters. Existing imports never
+regenerate passwords. Companion edits serialize autosave, reject stale versions,
+and retain client/field response fences; site fill excludes drafts.
+
+Microsoft user creation durably commits the credential draft in a fresh caller-
+scoped database transaction before Graph dispatch. Provider rejection and unknown
+outcomes remain distinct. Unknown outcomes cannot replay account creation, and
+completion cannot overwrite a later edit. Preserve fresh org/connection/MFA and
+credential permission checks. This bridge must fail closed if credentials storage
+is unavailable; it must never log password values.
+
+The operator credentials-rebuild tool defaults to dry-run and requires a verified
+backup file and matching source fingerprint to apply. It preserves secret bytes,
+retains original documentation/images, moves standalone secrets to verified
+Notes, and creates review drafts from explicit note account structures. Source
+provenance and audit receipts remain available. Existing row IDs/ciphertext are
+retained during metadata rebuilding to avoid breaking links or losing secrets.
+Companion 0.6.0 is a separately packaged client update; backend deployment does
+not publish or replace the Edge Store listing.
+
+
 ## Upstream v0.128.0 intake (2026-11-10)
 
 Candidate fork version is 0.128.5, based on exact upstream commit
@@ -139,10 +172,14 @@ The October 23 Exchange correction bounds `scripts/cloudcom/exchange-worker.py`
 to one active command and three retained tenant sessions, autonomously reaps
 60-second idle sessions, enforces hard response deadlines, and terminates
 process groups on retirement. SIGTERM drains the bounded active command.
-Preserve the Exchange overlay's quarter-core CPU budget, reduced CPU share and
+Preserve the Exchange overlay's one-core CPU budget, reduced CPU share and
 60-second stop grace during upstream intakes. The feature Compose regression
 test checks these budgets survive artifact mount updates. No dependency, schema,
 API, browser-extension or endpoint release is required for this worker change.
+The November 12 correction raises the former quarter-core ceiling to one core:
+cold PowerShell/EXO initialization exceeded the existing 45-second request
+deadline at the old quota; a direct delegation read succeeded with one core.
+The command deadline, single-command admission and idle reaping stay unchanged.
 Rollback the worker file with its verified predecessor while retaining the CPU
 containment; do not restore unrelated older Compose/database limits. Focused
 broker tests cover busy rejection, cursor-safe pool saturation, idle cleanup,
@@ -1231,3 +1268,7 @@ Native components 0.128.5 were promoted separately after canary acceptance. Futu
 The deployed server release remains bound to source `848055c33e5e99879560ab1230923c380810ba70`. Its original signed images-only inventory, source archive, and older native pairing describe that release at build time and remain unchanged. The separately signed native release and promotion evidence record the later native activation.
 
 When a subsequent server-only release advances the fork version, retain `binariesVersion: 0.128.5` until another native release is explicitly validated and promoted. Generate new source/build evidence for that server release; do not rewrite historical signatures or relabel existing images.
+
+### Exchange session reuse and TCP setup — 2026-11-12
+The tenant-bound broker reuses authenticated PowerShell sessions for five idle minutes (previously60seconds), with no synthetic keepalive traffic. The existing three-session pool and single-command admission remain. Rotation, tenant/generation checks, expired-session cleanup and uncertain-write protection remain unchanged. Worker-only Compose tcp_syn_retries=2 bounds initial TCP retransmission; no host-wide network change, IP pinning, certificate bypass or command-deadline increase. Tests:43 broker contracts incl120sec reuse/300sec idle cleanup,3 Compose-preservation tests. Worker healthy after deployment. Live mailbox initialconnection stillprovider_unreachable; reuse is not a fix for unreachable Exchangeaddresses. No successful live warm-session claim.
+Affected: scripts/cloudcom/exchange-worker.py/test.py, deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml and verifier, scripts/release/feature_compose_test.py. No database/API/endpoint format change. Rollback restores prior worker script mount and Compose sysctls together. Ordinary direct-code worker bind patch; immutable image and historical signed inventories unchanged.

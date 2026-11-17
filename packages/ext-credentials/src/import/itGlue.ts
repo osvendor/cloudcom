@@ -1,4 +1,5 @@
 import { parseTotpSecret } from '../server/totp';
+import { normalizeCredential } from './normalize';
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const MAX_ROWS = 10_000;
@@ -103,7 +104,7 @@ export function parseItGlueCsv(csv: string): ItGlueRow[] {
     if (!name) issues.push('missing_name');
     const username = get('username');
     const password = get('password');
-    const otpSecret = get('otp_secret').trim();
+    const otpSecret = get('otp_secret');
     if (!username) issues.push('missing_username');
     if (!password) issues.push('missing_password');
     if (otpSecret) {
@@ -120,6 +121,15 @@ export function parseItGlueCsv(csv: string): ItGlueRow[] {
       password, url: get('url'), notes: get('notes'), otpSecret,
       archived: ['true', '1', 'yes'].includes(archive), issues,
     };
+  });
+}
+
+/** Keep imported secret bytes intact; uncertain identities remain editable drafts. */
+export function normalizeItGlue(rows: readonly ItGlueRow[]) {
+  return rows.map(row => {
+    const normalized = normalizeCredential(row);
+    return { ...normalized, isDraft: normalized.disposition !== 'credential'
+      || !row.password || (!row.username.trim() && normalized.category !== 'Network / Wi-Fi') };
   });
 }
 
@@ -143,6 +153,12 @@ export function previewItGlue(rows: readonly ItGlueRow[]) {
   }
   return {
     total: rows.length, withOtp, archived, flagged, issueCounts,
+    normalization: normalizeItGlue(rows).reduce((counts, row) => {
+      if (row.disposition === 'note') counts.notesRequired++;
+      else if (row.isDraft) counts.drafts++;
+      else counts.credentials++;
+      return counts;
+    }, { credentials: 0, drafts: 0, notesRequired: 0 }),
     organizations: [...organizations].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name)),
   };
 }

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 const uuid=z.string().uuid();
-export const companionCallSchema=z.object({orgId:uuid.optional(),deviceId:uuid.optional(),path:z.string().max(4096),method:z.enum(['GET','POST','PUT','DELETE']).default('GET'),body:z.unknown().optional()}).strict();
+export const companionCallSchema=z.object({orgId:uuid.optional(),deviceId:uuid.optional(),path:z.string().max(4096),method:z.enum(['GET','POST','PATCH','PUT','DELETE']).default('GET'),body:z.unknown().optional()}).strict();
 export function classifyCompanionCall(input:z.infer<typeof companionCallSchema>){
   const {path,method,orgId,deviceId}=input;
   if(!path.startsWith('/')||path.startsWith('//')||/[\\#\r\n]/.test(path))return null;
@@ -14,6 +14,8 @@ export function classifyCompanionCall(input:z.infer<typeof companionCallSchema>)
   if(!deviceId&&method==='GET'&&[`${credentialBase}/devices`,`${credentialBase}/credentials`].includes(u.pathname))return {kind:'client' as const};
   if(!deviceId&&method==='POST'&&new RegExp(`^${credentialBase}/credentials/[0-9a-f-]{36}/fill$`,'i').test(u.pathname))return {kind:'client' as const};
   const vaultBase=`/credentials/orgs/${orgId}`;
+  if(!deviceId&&method==='POST'&&u.pathname===vaultBase+'/credentials')return {kind:'client' as const};
+  if(!deviceId&&method==='PATCH'&&new RegExp(`^${vaultBase}/credentials/[0-9a-f-]{36}$`,'i').test(u.pathname))return {kind:'client' as const};
   if(!deviceId&&method==='GET'&&(u.pathname===vaultBase+'/credentials'||u.pathname===vaultBase+'/documents'||new RegExp(`^${vaultBase}/documents/[0-9a-f-]{36}$`,'i').test(u.pathname)))return {kind:'client' as const};
   if(!deviceId&&method==='POST'&&new RegExp(`^${vaultBase}/credentials/[0-9a-f-]{36}/(reveal|otp)$`,'i').test(u.pathname))return {kind:'client' as const};
   if(!deviceId)return null;

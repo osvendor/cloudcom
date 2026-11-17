@@ -3,6 +3,15 @@ import {companionCallSchema,classifyCompanionCall} from './browserCompanionPolic
 const orgId='11111111-1111-4111-8111-111111111111',deviceId='22222222-2222-4222-8222-222222222222';
 const classify=(path:string,method='GET',body?:unknown)=>classifyCompanionCall(companionCallSchema.parse({orgId,deviceId,path,method,body}));
 describe('companion transport allowlist',()=>{
+  it('limits credential writes to the selected client and excludes device workspaces',()=>{
+    const path=`/credentials/orgs/${orgId}/credentials`;
+    expect(classifyCompanionCall({orgId,method:'POST',path})?.kind).toBe('client');
+    expect(classifyCompanionCall({orgId,method:'PATCH',path:path+'/'+deviceId})?.kind).toBe('client');
+    expect(classifyCompanionCall({orgId,method:'PATCH',path})).toBeNull();
+    expect(classifyCompanionCall({orgId,method:'DELETE',path:path+'/'+deviceId})).toBeNull();
+    expect(classifyCompanionCall({orgId:deviceId,method:'PATCH',path:path+'/'+deviceId})).toBeNull();
+    expect(classifyCompanionCall({orgId,deviceId,method:'POST',path})).toBeNull();
+  });
   it('binds tool paths to the explicitly selected device',()=>{
     expect(classify(`/system-tools/devices/${deviceId}/processes?limit=500`)?.kind).toBe('device');
     expect(classify(`/system-tools/devices/${orgId}/processes`)).toBeNull();

@@ -36,7 +36,7 @@ export { createUnixSocketExchangeWorkerPort } from './exchange-socket-client';
 export type { ExchangeDescriptorRegistry } from './exchange-services';
 export { createAdminGraphProvider } from './admin-graph-provider';
 export { createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangePreservationInspectClient } from './exchange-contract';
-export { claimDirectorySnapshot, publishDirectorySnapshotSource, releaseDirectorySnapshot } from './directory-snapshot-store';
+export { claimDirectorySnapshot, publishDirectorySnapshotSource, releaseDirectorySnapshot, invalidateDirectorySnapshot } from './directory-snapshot-store';
 export type { SnapshotBinding, SnapshotSource } from './directory-snapshot-store';
 
 const table = 'cloudcommand_threecx_connections';

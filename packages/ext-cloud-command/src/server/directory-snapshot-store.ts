@@ -47,10 +47,24 @@ export async function claimDirectorySnapshot(db: Executor, binding: SnapshotBind
       usage_status = CASE WHEN cloudcommand_microsoft_directory_snapshots.connection_generation = EXCLUDED.connection_generation
         AND cloudcommand_microsoft_directory_snapshots.tenant_id = EXCLUDED.tenant_id
         THEN cloudcommand_microsoft_directory_snapshots.usage_status ELSE 'never' END
-    WHERE cloudcommand_microsoft_directory_snapshots.lease_expires_at IS NULL
+    WHERE (cloudcommand_microsoft_directory_snapshots.lease_expires_at IS NULL
       OR cloudcommand_microsoft_directory_snapshots.lease_expires_at < now()
       OR cloudcommand_microsoft_directory_snapshots.connection_generation <> EXCLUDED.connection_generation
-      OR cloudcommand_microsoft_directory_snapshots.tenant_id <> EXCLUDED.tenant_id
+      OR cloudcommand_microsoft_directory_snapshots.tenant_id <> EXCLUDED.tenant_id)
+      AND (cloudcommand_microsoft_directory_snapshots.last_attempt_at IS NULL
+        OR cloudcommand_microsoft_directory_snapshots.last_attempt_at < now() - interval '5 minutes'
+        OR (cloudcommand_microsoft_directory_snapshots.refresh_requested_at > cloudcommand_microsoft_directory_snapshots.last_attempt_at
+          AND cloudcommand_microsoft_directory_snapshots.last_attempt_at < now() - interval '1 minute')
+        OR cloudcommand_microsoft_directory_snapshots.connection_generation <> EXCLUDED.connection_generation
+        OR cloudcommand_microsoft_directory_snapshots.tenant_id <> EXCLUDED.tenant_id)
+      AND (cloudcommand_microsoft_directory_snapshots.directory_collected_at IS NULL
+        OR cloudcommand_microsoft_directory_snapshots.directory_collected_at < now() - interval '15 minutes'
+        OR cloudcommand_microsoft_directory_snapshots.usage_collected_at IS NULL
+        OR cloudcommand_microsoft_directory_snapshots.usage_collected_at < now() - interval '6 hours'
+        OR cloudcommand_microsoft_directory_snapshots.directory_status = 'stale'
+        OR cloudcommand_microsoft_directory_snapshots.refresh_requested_at > cloudcommand_microsoft_directory_snapshots.last_attempt_at
+        OR cloudcommand_microsoft_directory_snapshots.connection_generation <> EXCLUDED.connection_generation
+        OR cloudcommand_microsoft_directory_snapshots.tenant_id <> EXCLUDED.tenant_id)
     RETURNING org_id
   `);
   return rows(result).length === 1 ? token : null;
@@ -101,4 +115,16 @@ export async function releaseDirectorySnapshot(db: Executor, binding: SnapshotBi
   await db.execute(sql`UPDATE cloudcommand_microsoft_directory_snapshots
     SET lease_token = NULL, lease_expires_at = NULL
     WHERE org_id = ${binding.orgId}::uuid AND lease_token = ${token}::uuid`);
+}
+
+/** Caller-scoped mutation invalidation. Revocation fences an already-running
+ * collector so it cannot overwrite the mutation with its older observation.
+ * Preserve both timestamps and usage: this queues metadata only after cooldown.
+ */
+export async function invalidateDirectorySnapshot(db: Executor, orgId: string): Promise<void> {
+  await db.execute(sql`UPDATE cloudcommand_microsoft_directory_snapshots s SET
+    directory_status='stale', lease_token=NULL, lease_expires_at=NULL
+    FROM cloudcommand_microsoft_admin_connections c
+    WHERE s.org_id=${orgId}::uuid AND c.org_id=s.org_id AND c.enabled=true
+      AND c.tenant_id=s.tenant_id AND c.generation=s.connection_generation`);
 }

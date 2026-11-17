@@ -11,6 +11,7 @@ import { agentRolloutLimits, isAgentUpdateGuardEnabled } from '../services/agent
 import { summarizeConsumerReadiness, workerReadinessRegistry } from '../services/workerReadinessRegistry';
 import { cpuStealPercent, parseCpuCounters, type CpuCounters } from './hostCpuSteal';
 import { getAlertWorkTelemetrySnapshot } from '../services/alertWorkTelemetry';
+import { exchangeBrokerHealth } from './exchangeBrokerHealth';
 
 type State = HealthCard['status'];
 const card = (id: string, title: string, status: State, value: string, detail: string): HealthCard => ({ id, title, status, value, detail });
@@ -64,6 +65,7 @@ async function collect(): Promise<OperationsHealth> {
   };
   // Single-flight, 30-second cache; fixed aggregate queries, never one request per endpoint.
   const groups = await Promise.all([
+    observe('exchange-worker', 'Exchange worker', async () => [await exchangeBrokerHealth()]),
     observe('cpu-steal', 'Host CPU scheduling', async () => {
       const current = parseCpuCounters(await readFile('/proc/stat', 'utf8'));
       const percent = cpuStealPercent(previousCpu, current);
@@ -140,7 +142,7 @@ async function collect(): Promise<OperationsHealth> {
       isAgentUpdateGuardEnabled() ? `${capacity.agentUpdates.allowed ? 'Ready' : 'Waiting for capacity'} · ${rollout.concurrent} at once` : 'Disabled',
       `1 per site; at most ${rollout.starts} new starts every ${rollout.windowMs / 60_000} minutes. ${capacity.enabled ? `Observed ${Math.round(capacity.agentUpdates.observedMs / 1000)}/60 seconds; average CPU ${capacity.agentUpdates.averages.cpuBusyPercent === null ? 'unknown' : capacity.agentUpdates.averages.cpuBusyPercent.toFixed(1) + '%'}. ${capacity.agentUpdates.reasons.length ? 'Waiting: ' + capacity.agentUpdates.reasons.join(', ') + '. ' : ''}Current pressure still blocks new starts. ` : 'Capacity measurements disabled. '}Confirmed components settle for at least 60 seconds. Missing completion holds its slot for 10 minutes, then defers that device for the rest of a 30-minute retry window. Signed emergency rollback and independent local repair are excluded.`));
   cards.push(card('api', 'API responsiveness', !lag.monitored || !lag.coversWindow ? 'unknown' : lag.worstLagMs >= 1000 ? 'critical' : lag.worstLagMs >= 250 ? 'attention' : 'healthy', lag.monitored && lag.coversWindow ? `${Math.round(lag.worstLagMs)} ms worst delay` : 'Warming up', `60-second event-loop window. API uses ${mb(process.memoryUsage().rss)}; uptime ${(process.uptime()/3600).toFixed(1)} hours. Attention at 250 ms, critical at 1 second.`),
-    card('workers', 'Background workers', !workers.required ? 'unknown' : workers.unavailable ? 'critical' : 'healthy', `${workers.runnable} / ${workers.required} ready`, `${workers.optionalRunning} optional workers running. API-process consumer readiness; queue depth and other worker processes are not measured.`),
+    card('workers', 'API background workers', !workers.required ? 'unknown' : workers.unavailable ? 'critical' : 'healthy', `${workers.runnable} / ${workers.required} ready`, `${workers.optionalRunning} optional workers running. API-process consumer readiness; queue depth and other worker processes are not measured.`),
     unknown('relay', 'Relay & bandwidth', 'Direct/relay split, relay bytes and Lightsail transfer allowance are not measured here.'),
     unknown('backups', 'Backup recovery', 'Backup freshness and restore verification are not measured here.'),
     unknown('external', 'Sign-in & integrations', 'Cloudflare, SSO, email, 3CX and Microsoft/Google upstream availability are not actively probed. A working API does not verify these services.'));
