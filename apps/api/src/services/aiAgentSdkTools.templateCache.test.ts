@@ -116,6 +116,32 @@ describe('Breeze tool template cache (#11004)', () => {
     }
   });
 
+  it('warms the fork Harmony tool without session auth and binds its authorization separately per session', async () => {
+    expect(warmBreezeToolSurface().tools).toBeGreaterThan(0);
+    const a = binding('Harmony A');
+    const b = binding('Harmony B');
+    const toolsA = buildBreezeSdkTools(a.getAuth as never, a.onPreToolUse, a.onPostToolUse);
+    const toolsB = buildBreezeSdkTools(b.getAuth as never, b.onPreToolUse, b.onPostToolUse);
+    const toolA = byName(toolsA, 'get_harmony_evidence');
+    const toolB = byName(toolsB, 'get_harmony_evidence');
+    expect(toolA.handler).not.toBe(toolB.handler);
+    expect(a.getAuth).not.toHaveBeenCalled();
+    expect(b.getAuth).not.toHaveBeenCalled();
+    const input = { deviceId: '11111111-1111-4111-8111-111111111111' };
+    const resultA = await toolA.handler(input, {});
+    expect(resultA.isError).toBe(true);
+    expect(resultA.content[0]!.text).toContain('Harmony A denied');
+    expect(a.onPreToolUse.mock.calls[0]?.[0]).toBe('get_harmony_evidence');
+    expect(b.onPreToolUse).not.toHaveBeenCalled();
+    const resultB = await toolB.handler(input, {});
+    expect(resultB.isError).toBe(true);
+    expect(resultB.content[0]!.text).toContain('Harmony B denied');
+    expect(a.onPreToolUse).toHaveBeenCalledTimes(1);
+    expect(b.onPreToolUse).toHaveBeenCalledTimes(1);
+    expect(a.getAuth).not.toHaveBeenCalled();
+    expect(b.getAuth).not.toHaveBeenCalled();
+  });
+
   it('each bound handler dispatches to its own session callbacks only', async () => {
     const a = binding('A');
     const b = binding('B');
