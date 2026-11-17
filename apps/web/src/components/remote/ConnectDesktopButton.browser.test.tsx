@@ -3,10 +3,26 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ConnectDesktopButton from './ConnectDesktopButton';
 import { fetchWithAuth } from '@/stores/auth';
 import { launchBrowserDesktop, isBrowserDesktopActive } from '../cloudcom/browserDesktop/launch';
-vi.mock('@/stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+const auth = vi.hoisted(() => ({
+  user: { permissions: [{ resource: 'remote', action: 'access' }] },
+}));
+vi.mock('@/stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  useAuthStore: (selector: (state: typeof auth) => unknown) => selector(auth),
+}));
 vi.mock('../cloudcom/browserDesktop/launch', () => ({ launchBrowserDesktop: vi.fn(), isBrowserDesktopActive: vi.fn(() => false) }));
-beforeEach(() => { vi.mocked(fetchWithAuth).mockReset(); vi.mocked(launchBrowserDesktop).mockClear(); vi.mocked(isBrowserDesktopActive).mockReturnValue(false); });
+beforeEach(() => { auth.user.permissions = [{ resource: 'remote', action: 'access' }]; vi.mocked(fetchWithAuth).mockReset(); vi.mocked(launchBrowserDesktop).mockClear(); vi.mocked(isBrowserDesktopActive).mockReturnValue(false); });
 describe('browser desktop default', () => {
+  it('does not auto-start after remote access permission is removed', async () => {
+    auth.user.permissions = [];
+    const view = render(<ConnectDesktopButton deviceId="device" autoStart preferBuiltIn />);
+    expect(fetchWithAuth).not.toHaveBeenCalled();
+    expect(launchBrowserDesktop).not.toHaveBeenCalled();
+    view.rerender(<ConnectDesktopButton deviceId="device" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+    expect(fetchWithAuth).not.toHaveBeenCalled();
+    expect(launchBrowserDesktop).not.toHaveBeenCalled();
+  });
   it('automatically opens the explicitly requested browser desktop once, even with a native provider', async () => {
     vi.mocked(fetchWithAuth).mockImplementation(async path => new Response(JSON.stringify(
       String(path).startsWith('/devices/') ? { desktopAccess: null, hasRemoteAccessLauncher: true } :

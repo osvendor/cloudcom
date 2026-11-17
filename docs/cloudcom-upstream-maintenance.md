@@ -6,8 +6,13 @@ This intake targets upstream `cdea593bbfc0bfd6dc12373b437a36ea005e67ca`
 (v0.129.0) and preserves the deployed November 12 credential, Microsoft cache,
 Exchange reuse and worker-recovery changes. These are candidate integration
 choices, not deployment or endpoint promotion. The core migration comparison
-contains 19 additive migrations and no modified existing migrations. Validate
-on an isolated database; preserve separate extension migrations and ordering.
+contains 19 new migration files and no modified existing migrations. Their
+effects are not all additive: upstream removes the unused
+`patch_compliance_snapshots` table, replaces authorization trigger functions,
+changes retention foreign-key behavior and builds concurrent indexes. Verify
+the retired table's row count before cutover and preserve a restorable backup;
+rollback must restore matching data, not merely old images. Validate on an
+isolated database; preserve separate extension migrations and ordering.
 
 Adopt #11810 (`85b336d4d`): stronger held-connection tripwires detect outer
 transactions still holding a pool slot inside `runOutsideDbContext`; outbound
