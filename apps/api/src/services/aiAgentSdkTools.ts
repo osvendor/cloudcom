@@ -2779,7 +2779,7 @@ function declareBreezeSdkToolTemplates(): SdkTool[] {
       'get_harmony_evidence',
       registryDescription('get_harmony_evidence'),
       { deviceId: uuid },
-      makeHandler('get_harmony_evidence', getAuth, onPreToolUse, onPostToolUse)
+      makeHandler('get_harmony_evidence')
     ),
 
     tool(

@@ -904,6 +904,15 @@ async function registerFromOfficialManifest(args: {
       const edition = verified.edition ?? EDITION_SELF_HOST;
       const osParam = bin.platform === "macos" ? "darwin" : bin.platform;
       const downloadUrl = downloadUrlFor(osParam, bin.architecture);
+      // The authenticated inventory identifies its publisher; local mode may
+      // still have the default official repository in its environment.
+      const signedMetadata = await applyDeploymentSigning({
+        metadata: { checksum: verified.sha256, size: verified.size,
+          releaseManifest: manifestString, manifestSignature: signatureString,
+          signingKeyId: "release-artifact-manifest-ed25519", edition },
+        version, component, platform: bin.platform, arch: bin.architecture,
+        downloadUrl, repository: verified.repository,
+      });
 
       if (autoPromote) {
         await tx
@@ -931,9 +940,9 @@ async function registerFromOfficialManifest(args: {
           checksum: verified.sha256,
           fileSize: BigInt(verified.size),
           isLatest: autoPromote,
-          releaseManifest: manifestString,
-          manifestSignature: signatureString,
-          signingKeyId: "release-artifact-manifest-ed25519",
+          releaseManifest: signedMetadata.releaseManifest,
+          manifestSignature: signedMetadata.manifestSignature,
+          signingKeyId: signedMetadata.signingKeyId,
           edition,
         })
         .onConflictDoUpdate({
@@ -948,9 +957,9 @@ async function registerFromOfficialManifest(args: {
             downloadUrl,
             checksum: verified.sha256,
             fileSize: BigInt(verified.size),
-            releaseManifest: manifestString,
-            manifestSignature: signatureString,
-            signingKeyId: "release-artifact-manifest-ed25519",
+            releaseManifest: signedMetadata.releaseManifest,
+            manifestSignature: signedMetadata.manifestSignature,
+            signingKeyId: signedMetadata.signingKeyId,
             ...(autoPromote ? { isLatest: true } : {}),
           },
         });
