@@ -399,6 +399,30 @@ class ExchangeBrokerTests(unittest.TestCase):
             launch.assert_not_called()
         broker.admission.release()
 
+    def test_reuses_tenant_session_across_menus_until_five_minutes_idle(self):
+        class Session:
+            def __init__(self, request, descriptor, script):
+                self.descriptor = descriptor; self.used = time.monotonic()
+                self.process = FakeProcess(b''); self.lock = threading.RLock(); self.closed = False
+            def close(self): self.closed = True
+            def run(self, request):
+                self.used = time.monotonic()
+                return {'requestId': request['requestId'], 'ok': True}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell', Session), patch.object(worker.time, 'monotonic', return_value=0) as clock:
+            self.assertTrue(broker.execute(REQUEST)['ok'])
+            first = broker.pool[REQUEST['tenantId']]
+            clock.return_value = 120
+            self.assertTrue(broker.execute(REQUEST)['ok'])
+            self.assertIs(broker.pool[REQUEST['tenantId']], first)
+            clock.return_value = 419
+            broker.reap_idle()
+            self.assertFalse(first.closed)
+            clock.return_value = 421
+            broker.reap_idle()
+            self.assertTrue(first.closed)
+            self.assertFalse(broker.pool)
+
     def test_invalid_health_probe_stays_healthy_when_busy_or_stopping(self):
         broker = worker.Broker('/unused', '/unused.ps1')
         broker.admission.acquire()

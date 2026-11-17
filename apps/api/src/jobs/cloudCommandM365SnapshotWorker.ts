@@ -7,7 +7,7 @@ import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { cloudCommandAdminRuntime } from '../extensions/cloudCommandAdminRuntime';
 import { safeFetch } from '../services/urlSafety';
 
-type BoundRow = SnapshotBinding & { id: string };
+type BoundRow = SnapshotBinding & { id: string; includeUsage: boolean };
 const SWEEP_MS = 60_000;
 let timer: ReturnType<typeof setInterval> | undefined;
 let sweeping = false;
@@ -22,22 +22,37 @@ async function system<T>(label: string, fn: () => Promise<T>): Promise<T> {
 
 /** Enumeration, claim and publish each hold separate short database contexts.
  * Graph and Exchange calls never pin a pooled PostgreSQL transaction. */
-async function candidates(): Promise<BoundRow[]> {
+async function candidates(configuration: { clientId: string; credentialVersion: string }): Promise<BoundRow[]> {
   return system('candidates', async () => rows<BoundRow>(await db.execute(sql`
     SELECT c.id, c.org_id AS "orgId", c.tenant_id AS "tenantId", c.client_id AS "clientId",
-      c.credential_version AS "credentialVersion", c.generation
+      c.credential_version AS "credentialVersion", c.generation,
+      COALESCE((s.usage_collected_at IS NULL OR s.usage_collected_at < now() - interval '6 hours'
+        OR s.connection_generation <> c.generation OR s.tenant_id <> c.tenant_id
+        OR s.refresh_requested_at > s.last_attempt_at), false) AS "includeUsage"
     FROM cloudcommand_microsoft_admin_connections c
     LEFT JOIN cloudcommand_microsoft_directory_snapshots s ON s.org_id = c.org_id
-    WHERE c.enabled = true AND s.refresh_requested_at IS NOT NULL
-      AND (s.last_attempt_at IS NULL OR s.refresh_requested_at > s.last_attempt_at)
-    ORDER BY s.last_attempt_at NULLS FIRST, c.org_id
-    LIMIT 10
+    WHERE c.enabled = true
+      AND c.client_id = ${configuration.clientId}::uuid AND c.credential_version = ${configuration.credentialVersion}
+      AND (s.lease_expires_at IS NULL OR s.lease_expires_at < now()
+        OR s.connection_generation <> c.generation OR s.tenant_id <> c.tenant_id)
+      AND (s.last_attempt_at IS NULL OR s.last_attempt_at < now() - interval '5 minutes'
+        OR (s.refresh_requested_at > s.last_attempt_at AND s.last_attempt_at < now() - interval '1 minute')
+        OR s.connection_generation <> c.generation OR s.tenant_id <> c.tenant_id)
+      AND (s.directory_collected_at IS NULL OR s.directory_collected_at < now() - interval '15 minutes'
+        OR s.usage_collected_at IS NULL OR s.usage_collected_at < now() - interval '6 hours'
+        OR s.directory_status = 'stale' OR s.refresh_requested_at > s.last_attempt_at
+        OR s.connection_generation <> c.generation OR s.tenant_id <> c.tenant_id)
+    ORDER BY (s.refresh_requested_at > s.last_attempt_at) DESC NULLS LAST,
+      s.last_attempt_at NULLS FIRST, c.org_id
+    LIMIT 2
   `)));
 }
 
 /** Reads only the configured Cloud Command enterprise app and a tenant-bound
  * Exchange descriptor. A partial Graph or mailbox page never becomes ready. */
-export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding): Promise<{
+export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding, options: {
+  includeUsage?: boolean; onDirectory?: (directory: Record<string, unknown>) => Promise<void>;
+} = {}): Promise<{
   directory: Record<string, unknown>;
   usage: Record<string, unknown> | null;
 }> {
@@ -48,7 +63,7 @@ export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding):
     })),
     acquireToken: () => cloudCommandAdminRuntime.acquireToken(binding),
   });
-  const [users, groups, licenses] = await Promise.all([graph.listUsers(), graph.listGroups(), graph.listLicenses()]);
+  const [users, groups, licenses] = await Promise.all([graph.listUsers({ includeUsage: options.includeUsage !== false }), graph.listGroups(), graph.listLicenses()]);
   if (users.partial || groups.partial || licenses.partial) throw new Error('m365_directory_partial');
   const exchange = await cloudCommandAdminRuntime.exchange();
   if (!exchange) throw new Error('m365_exchange_unavailable');
@@ -66,6 +81,9 @@ export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding):
     mailboxes: mailboxes.records.map(({ id, primarySmtpAddress, recipientType, archiveEnabled }) =>
       ({ id, primarySmtpAddress, recipientType, archiveEnabled })),
   };
+  // Make current directory metadata visible before slow mailbox/drive statistics.
+  await options.onDirectory?.(directory);
+  if (options.includeUsage === false) return { directory, usage: null };
   // Enumeration deliberately omits statistics so it can return within the
   // worker's per-command timeout. Fetch every size through the bound mailbox
   // ID before declaring the usage source ready; a deadline leaves old usage
@@ -76,6 +94,9 @@ export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding):
   try {
     for (const row of mailboxes.records) {
       if (Date.now() >= statisticsDeadline) return { directory, usage: null };
+      // Leave the single-command Exchange worker available between bulk reads
+      // so an interactive mailbox refresh can take its turn.
+      await new Promise(resolve => setTimeout(resolve, 1000));
       const actual = await statistics(descriptor, row.id);
       if (actual.recipientType !== row.recipientType
         || actual.primarySmtpAddress.toLowerCase() !== row.primarySmtpAddress.toLowerCase())
@@ -106,21 +127,28 @@ export async function collectCloudCommandM365Snapshot(binding: SnapshotBinding):
     oneDriveByUserId: drives, exchangeCollectedAt: usageInventory.collectedAt } };
 }
 
-export async function refreshCloudCommandM365Snapshot(binding: SnapshotBinding): Promise<void> {
+export async function refreshCloudCommandM365Snapshot(binding: SnapshotBinding, includeUsage = true): Promise<void> {
   const token = await system('claim', () => claimDirectorySnapshot(db, binding));
   if (!token) return;
   try {
     let directory: Record<string, unknown> | null = null;
     let usage: Record<string, unknown> | null = null;
+    let directoryPublished = false;
     try {
-      ({ directory, usage } = await runOutsideDbContext(() => collectCloudCommandM365Snapshot(binding)));
+      ({ directory, usage } = await runOutsideDbContext(() => collectCloudCommandM365Snapshot(binding, {
+        includeUsage, onDirectory: async data => {
+          const published = await system('publishDirectory', () => publishDirectorySnapshotSource(db, binding, token, 'directory', data));
+          if (!published) throw new Error('snapshot_binding_changed');
+          directoryPublished = true;
+        },
+      })));
     } catch (error) {
       console.warn('[CloudCommandM365Snapshot] collection failed', {
-        orgId: binding.orgId, reason: error instanceof Error ? error.message : 'unknown',
+        orgId: binding.orgId, reason: 'collection_unavailable',
       });
     }
-    await system('publishDirectory', () => publishDirectorySnapshotSource(db, binding, token, 'directory', directory));
-    await system('publishUsage', () => publishDirectorySnapshotSource(db, binding, token, 'usage', usage));
+    if (!directoryPublished) await system('publishDirectory', () => publishDirectorySnapshotSource(db, binding, token, 'directory', directory));
+    if (includeUsage) await system('publishUsage', () => publishDirectorySnapshotSource(db, binding, token, 'usage', usage));
   } finally {
     await runOutsideDbContext(() => system('release', () => releaseDirectorySnapshot(db, binding, token)));
   }
@@ -132,10 +160,10 @@ async function sweep(): Promise<void> {
   try {
     const configuration = await cloudCommandAdminRuntime.configuration();
     if (!configuration) return;
-    for (const row of await candidates()) {
+    for (const row of await candidates(configuration)) {
       if (row.clientId !== configuration.clientId || row.credentialVersion !== configuration.credentialVersion) continue;
-      try { await refreshCloudCommandM365Snapshot(row); }
-      catch (error) { console.warn('[CloudCommandM365Snapshot] refresh failed', row.orgId, error); }
+      try { await refreshCloudCommandM365Snapshot(row, row.includeUsage !== false); }
+      catch { console.warn('[CloudCommandM365Snapshot] refresh failed', { orgId: row.orgId }); }
     }
   } finally { sweeping = false; }
 }

@@ -22,6 +22,8 @@ const m = vi.hoisted(() => ({
   lookups: [] as string[][],
   lookupError: null as Error | null,
   captureMessage: vi.fn(),
+  closeWorker: vi.fn(),
+  closeQueue: vi.fn(),
 }));
 
 vi.mock('bullmq', () => ({
@@ -30,7 +32,7 @@ vi.mock('bullmq', () => ({
     add = (...a: unknown[]) => m.add(...a);
     getRepeatableJobs = () => m.getRepeatableJobs();
     removeRepeatableByKey = (...a: unknown[]) => m.removeRepeatableByKey(...a);
-    close = vi.fn();
+    close = (...a: unknown[]) => m.closeQueue(...a);
   },
   Worker: class {
     constructor(n: string, p: (job: { data: Record<string, unknown> }) => Promise<unknown>) {
@@ -38,7 +40,7 @@ vi.mock('bullmq', () => ({
       m.processor.current = p;
     }
     on = vi.fn();
-    close = vi.fn();
+    close = (...a: unknown[]) => m.closeWorker(...a);
   },
   Job: class {},
 }));
@@ -191,6 +193,24 @@ describe('sweepOrphanTranscripts', () => {
 });
 
 describe('initializeAiTranscriptSweeper wiring', () => {
+  it('drains its worker before removing only its own repeat schedule and closing', async () => {
+    await initializeAiTranscriptSweeper();
+    m.getRepeatableJobs.mockResolvedValue([{name:'ai-transcript-sweeper',key:'own-repeat'},{name:'unrelated',key:'leave-alone'}]);
+    await shutdownAiTranscriptSweeper();
+    expect(m.removeRepeatableByKey).toHaveBeenCalledExactlyOnceWith('own-repeat');
+    expect(m.closeWorker.mock.invocationCallOrder[0]).toBeLessThan(m.removeRepeatableByKey.mock.invocationCallOrder[0]!);
+    expect(m.removeRepeatableByKey.mock.invocationCallOrder[0]).toBeLessThan(m.closeQueue.mock.invocationCallOrder[0]!);
+    expect(m.queueNames).toHaveLength(1);
+  });
+  it('closes its queue and propagates failed schedule cleanup without touching other queues', async () => {
+    await initializeAiTranscriptSweeper();
+    m.getRepeatableJobs.mockRejectedValueOnce(new Error('Redis unavailable'));
+    await expect(shutdownAiTranscriptSweeper()).rejects.toThrow('Redis unavailable');
+    expect(m.closeQueue).toHaveBeenCalledOnce();
+    expect(m.removeRepeatableByKey).not.toHaveBeenCalled();
+    await shutdownAiTranscriptSweeper();
+    expect(m.closeQueue).toHaveBeenCalledOnce();
+  });
   it('runs a worker that attaches under the stable manifest name and schedules the nightly job', async () => {
     await initializeAiTranscriptSweeper();
     expect(m.attach).toHaveBeenCalledWith(expect.anything(), 'aiTranscriptSweeper');

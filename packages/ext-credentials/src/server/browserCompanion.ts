@@ -5,6 +5,7 @@ import type { ExtensionRuntimeContext, ExtensionRequestAuthorization } from '@br
 import type { DurableAudit, CompanionAuthorize } from './index';
 import { unseal } from './secrets';
 import { generateTotp } from './totp';
+import { credentialMetadata } from './credentialDrafts';
 
 type Auth = { scope: string; principal: { kind: string }; partnerId: string | null; user: { id: string }; canAccessOrg(id: string): boolean };
 type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; browserOrg: string };
@@ -65,7 +66,7 @@ export function createBrowserCompanionRoutes(context: ExtensionRuntimeContext, a
     const origin = websiteOrigin(c.req.query('origin') ?? ''), q = c.req.query('q') ?? '';
     if (!origin || q.length>200) return c.json({error:'A secure website is required'},400);
     // Bound query without global credential search; exact scheme/host/port matching.
-    const found = rows<{url:string;name:string;username:string;email:string}>(await context.db.execute(sql`SELECT id,name,username,email,url,has_password AS "hasPassword",has_otp AS "hasOtp" FROM credentials_records WHERE org_id=${c.get('browserOrg')}::uuid AND archived=false ORDER BY name,id LIMIT 2001`));
+    const found = rows<{url:string;name:string;username:string;email:string}>(await context.db.execute(sql`SELECT ${credentialMetadata} FROM credentials_records WHERE org_id=${c.get('browserOrg')}::uuid AND archived=false AND is_draft=false ORDER BY name,id LIMIT 2001`));
     const credentials = found.slice(0,2000).filter(x=>websiteOrigin(x.url)===origin && `${x.name} ${x.username} ${x.email}`.toLowerCase().includes(q.toLowerCase()));
     return c.json({credentials:credentials.slice(0,100),truncated:found.length>2000 || credentials.length>100});
   });
@@ -76,7 +77,7 @@ export function createBrowserCompanionRoutes(context: ExtensionRuntimeContext, a
     const {origin,field}=input.data;
     if (!p.hasPermission('credentials','read') || !p.hasPermission('credentials',field==='otp'?'otp':'reveal')) return c.json({error:'Access denied'},403);
     const orgId=c.get('browserOrg');
-    const record=rows<{url:string;username:string;email:string;secret_ciphertext:string}>(await context.db.execute(sql`SELECT url,username,email,secret_ciphertext FROM credentials_records WHERE org_id=${orgId}::uuid AND id=${id.data}::uuid AND archived=false`))[0];
+    const record=rows<{url:string;username:string;email:string;secret_ciphertext:string}>(await context.db.execute(sql`SELECT url,username,email,secret_ciphertext FROM credentials_records WHERE org_id=${orgId}::uuid AND id=${id.data}::uuid AND archived=false AND is_draft=false`))[0];
     if (!record || websiteOrigin(record.url)!==origin) return c.json({error:'Credential does not match this website'},404);
     let value=record.username || record.email || '', expiresAt:string|undefined;
     if(field!=='username') { const secret=unseal(context.secrets,orgId,id.data,record.secret_ciphertext); if(field==='password')value=secret.password;else {if(!secret.otpSecret)return c.json({error:'No OTP available'},404);const otp=generateTotp(secret.otpSecret);value=otp.code;expiresAt=otp.expiresAt;} }

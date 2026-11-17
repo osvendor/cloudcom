@@ -12,6 +12,8 @@ const snapshot = z.object({
   usage_data: z.unknown().nullable(), usage_collected_at: z.coerce.date().nullable(),
   directory_status: sourceStatus, usage_status: sourceStatus,
   last_attempt_at: z.coerce.date().nullable(),
+  lease_expires_at: z.coerce.date().nullable().optional(),
+  refresh_requested_at: z.coerce.date().nullable().optional(),
 });
 
 function rows<T>(value: unknown): T[] {
@@ -34,7 +36,8 @@ export function mountDirectorySnapshotRoutes(
     if (!connection.enabled || !connection.tenantId) return c.json({ code: 'connection_not_ready' }, 409);
     const current = rows<unknown>(await context.db.execute(sql`
       SELECT s.tenant_id, s.connection_generation, s.directory_data, s.directory_collected_at,
-        s.usage_data, s.usage_collected_at, s.directory_status, s.usage_status, s.last_attempt_at
+        s.usage_data, s.usage_collected_at, s.directory_status, s.usage_status, s.last_attempt_at,
+        s.lease_expires_at, s.refresh_requested_at
       FROM cloudcommand_microsoft_directory_snapshots s
       JOIN cloudcommand_microsoft_admin_connections c ON c.org_id = s.org_id
       WHERE s.org_id = ${orgId}::uuid AND c.enabled = true
@@ -45,13 +48,18 @@ export function mountDirectorySnapshotRoutes(
     const parsed = current === undefined ? null : snapshot.safeParse(current);
     if (parsed && !parsed.success) return c.json({ code: 'snapshot_invalid' }, 503);
     const data = parsed?.data;
+    const effectiveStatus = (status: 'never'|'ready'|'stale', collected: Date|null, ttl:number) =>
+      status==='ready'&&(!collected||Date.now()-collected.getTime()>=ttl)?'stale':status;
     return c.json({
       tenantId: connection.tenantId,
-      directory: data ? { status: data.directory_status, collectedAt: data.directory_collected_at?.toISOString() ?? null,
+      directory: data ? { status: effectiveStatus(data.directory_status,data.directory_collected_at,15*60_000), collectedAt: data.directory_collected_at?.toISOString() ?? null,
         data: data.directory_data } : { status: 'never', collectedAt: null, data: null },
-      usage: data ? { status: data.usage_status, collectedAt: data.usage_collected_at?.toISOString() ?? null,
+      usage: data ? { status: effectiveStatus(data.usage_status,data.usage_collected_at,6*60*60_000), collectedAt: data.usage_collected_at?.toISOString() ?? null,
         data: data.usage_data } : { status: 'never', collectedAt: null, data: null },
       lastAttemptAt: data?.last_attempt_at?.toISOString() ?? null,
+      refreshing: Boolean(data?.lease_expires_at && data.lease_expires_at.getTime()>Date.now()),
+      refreshQueued: Boolean(data?.refresh_requested_at && (!data.last_attempt_at || data.refresh_requested_at>data.last_attempt_at)),
+      cadenceSeconds: { directory: 900, usage: 21600 },
     });
   });
   app.post('/microsoft/directory/refresh', async c => {

@@ -393,7 +393,9 @@ export function createAdminGraphProvider(options: {
       return { domains: organization.value[0]!.verifiedDomains.map(domain => domain.name.toLowerCase()),
         defaultUsageLocation: defaultLocation && /^[A-Z]{2}$/.test(defaultLocation) ? defaultLocation : null };
     },
-    async createUser(input: AdminUserCreate, authorize?: () => Promise<void>) {
+    async createUser(input: AdminUserCreate, authorize?: () => Promise<void>, beforeCreate?: (input: {
+      userPrincipalName: string; password: string; forceChangePasswordNextSignIn: boolean;
+    }) => Promise<void>) {
       const value = parse(adminUserCreateSchema, input, 'invalid_input');
       const [localPart, domain] = value.userPrincipalName.split('@');
       if (!localPart || localPart.length > 64 || !domain) throw new AdminGraphError('invalid_input');
@@ -411,6 +413,13 @@ export function createAdminGraphProvider(options: {
       await authorize?.();
       const temporaryPassword = value.password ?? createTemporaryPassword();
       const forceChangePasswordNextSignIn = value.forceChangePasswordNextSignIn ?? true;
+      // This host-only hook must durably preserve the secret before Graph can
+      // accept creation. It runs only after tenant and verified-domain checks.
+      if (beforeCreate) {
+        await beforeCreate({ userPrincipalName: value.userPrincipalName,
+          password: temporaryPassword, forceChangePasswordNextSignIn });
+        await authorize?.();
+      }
       const result = await request(token, '/users', 'POST', {
         accountEnabled: true, displayName: value.displayName, mailNickname: localPart,
         userPrincipalName: value.userPrincipalName,
@@ -488,7 +497,7 @@ export function createAdminGraphProvider(options: {
       } catch { /* Accepted write; caller must refresh to reconcile. */ }
       return { accepted: true as const, changed: true as const, verified };
     },
-    async listUsers() {
+    async listUsers(options: { includeUsage?: boolean } = {}) {
       const token = await session();
       const result = await collection(`/users?$select=${userSelect}&$top=100`, user, token);
       const assignedSkuIds = result.items.flatMap(item => item.assignedLicenses?.map(license => license.skuId) ?? []);
@@ -500,7 +509,7 @@ export function createAdminGraphProvider(options: {
         } catch { /* Directory remains usable when the SKU catalog is unavailable. */ }
       }
       let driveUsage: Map<string, number> | null = null;
-      try { driveUsage = await readOneDriveUsage(token); }
+      try { if (options.includeUsage !== false) driveUsage = await readOneDriveUsage(token); }
       catch { /* Report consent or service failure must not block directory inventory. */ }
       const reportNamesConcealed = driveUsage !== null && driveUsage.size > 0
         && ![...driveUsage.keys()].some(owner => owner.includes('@'));

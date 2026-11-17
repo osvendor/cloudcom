@@ -31,6 +31,70 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it.each(['forwarding','autoreply','delegation'])('shows failed cold %s refresh without inventing mailbox settings',async tool=>{
+    const id='66666666-6666-4666-8666-666666666666';
+    const request=vi.fn(async(path:string,init?:RequestInit)=>{
+      if(path==='/microsoft/connection')return Response.json({available:true,connected:true,enabled:true,canManage:true});
+      if(path==='/microsoft/directory/snapshot')return new Response(null,{status:404});
+      if(path==='/microsoft/resources/users')return Response.json({items:[{id,values:{displayName:'Ada'}}],columns:[{key:'displayName',label:'Name'}],complete:true,checkedAt:'now'});
+      const body=JSON.parse(String(init?.body||'{}'));if(body.type?.startsWith('mailbox.'))return Response.json({pending:true,cache:{checkedAt:null,stale:true,refreshing:false,refreshFailed:true}});throw Error('Unexpected');
+    });
+    const page=mount(request);await flush();await flush();page.shadowRoot!.querySelector<HTMLButtonElement>(`[data-user-action="${tool}"]`)!.click();await flush();
+    expect(page.shadowRoot!.textContent).toContain('Refresh failed; use Refresh to retry');expect(page.shadowRoot!.textContent).not.toContain('No direct delegates found');
+    expect(page.shadowRoot!.querySelector('#autoreply-save')).toBeNull();expect(page.shadowRoot!.querySelector('#forwarding-save')).toBeNull();
+  });
+  it('discards an outstanding mailbox response after closing its dialog',async()=>{
+    const id='66666666-6666-4666-8666-666666666666';let finish!:(response:Response)=>void;
+    const request=vi.fn(async(path:string,init?:RequestInit)=>{
+      if(path==='/microsoft/connection')return Response.json({available:true,connected:true,enabled:true,canManage:true});
+      if(path==='/microsoft/directory/snapshot')return new Response(null,{status:404});
+      if(path==='/microsoft/resources/users')return Response.json({items:[{id,values:{displayName:'Ada'}}],columns:[{key:'displayName',label:'Name'}],complete:true,checkedAt:'now'});
+      if(JSON.parse(String(init?.body||'{}')).type==='mailbox.forwarding.get')return new Promise<Response>(resolve=>finish=resolve);throw Error('Unexpected');
+    });
+    const page=mount(request);await flush();await flush();page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-action="forwarding"]')!.click();await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();finish(Response.json({mailboxId:id,smtpAddress:'late@example.test',keepCopy:true,internalRecipient:null,cache:{checkedAt:'now',stale:true,refreshing:true}}));await flush();
+    expect(page.shadowRoot!.textContent).not.toContain('late@example.test');expect(page.shadowRoot!.querySelector('[role="dialog"]')).toBeNull();
+  });
+  it('renders saved mailbox settings immediately, preserves edits during polling and forces manual refresh', async () => {
+    const id='66666666-6666-4666-8666-666666666666'; let reads=0;
+    const request=vi.fn(async(path:string,init?:RequestInit)=>{
+      if(path==='/microsoft/connection')return Response.json({available:true,connected:true,enabled:true,canManage:true});
+      if(path==='/microsoft/directory/snapshot')return new Response(null,{status:404});
+      if(path==='/microsoft/resources/users')return Response.json({items:[{id,values:{displayName:'Ada'}}],columns:[{key:'displayName',label:'Name'}],complete:true,checkedAt:'now'});
+      const body=JSON.parse(String(init?.body||'{}'));
+      if(body.type==='mailbox.forwarding.get'){reads++;return Response.json({mailboxId:id,smtpAddress:'saved@example.test',keepCopy:true,internalRecipient:null,cache:{checkedAt:'2026-11-12T12:00:00Z',stale:reads===1,refreshing:reads===1}})}
+      throw Error('Unexpected request');
+    });
+    const page=mount(request);await flush();await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-action="forwarding"]')!.click();await flush();
+    const root=page.shadowRoot!;expect(root.textContent).toContain('Updated');expect(root.textContent).toContain('Refreshing in background');
+    expect(root.querySelector<HTMLButtonElement>('#forwarding-save')!.disabled).toBe(true);
+    expect(root.querySelector<HTMLInputElement>('#forwarding-address')!.disabled).toBe(false);
+    expect(request.mock.calls.some(([,init])=>String(init?.body).includes('user.get'))).toBe(false);
+    const input=root.querySelector<HTMLInputElement>('#forwarding-address')!;input.value='typed@example.test';input.dispatchEvent(new Event('input'));
+    // Manual refresh supersedes the scheduled poll and must carry the force flag.
+    root.querySelector<HTMLButtonElement>('#forwarding-refresh')!.click();await flush();
+    expect(JSON.parse(String(request.mock.calls.at(-1)?.[1]?.body))).toMatchObject({forceRefresh:true});
+    expect(root.querySelector<HTMLInputElement>('#forwarding-address')!.value).toBe('typed@example.test');
+    expect(root.querySelector<HTMLButtonElement>('#forwarding-save')!.disabled).toBe(false);
+    page.remove();
+  });
+  it('does not fabricate cold settings and bounds polling, stopping on dialog close',async()=>{
+    const id='66666666-6666-4666-8666-666666666666';let reads=0;
+    const request=vi.fn(async(path:string,init?:RequestInit)=>{
+      if(path==='/microsoft/connection')return Response.json({available:true,connected:true,enabled:true,canManage:true});
+      if(path==='/microsoft/directory/snapshot')return new Response(null,{status:404});
+      if(path==='/microsoft/resources/users')return Response.json({items:[{id,values:{displayName:'Ada'}}],columns:[{key:'displayName',label:'Name'}],complete:true,checkedAt:'now'});
+      const body=JSON.parse(String(init?.body||'{}'));if(body.type==='mailbox.autoreply.get'){reads++;return Response.json({pending:true,cache:{checkedAt:null,stale:true,refreshing:true}})}throw Error('Unexpected');
+    });
+    const page=mount(request);await flush();await flush();vi.useFakeTimers();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-action="autoreply"]')!.click();await vi.advanceTimersByTimeAsync(0);
+    expect(page.shadowRoot!.querySelector('#autoreply-save')).toBeNull();expect(page.shadowRoot!.textContent).toContain('No saved result yet');
+    await vi.advanceTimersByTimeAsync(65000);expect(reads).toBe(13);
+    await vi.advanceTimersByTimeAsync(65000);expect(reads).toBe(13);
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#autoreply-refresh')!.click();await vi.advanceTimersByTimeAsync(0);
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();await vi.advanceTimersByTimeAsync(15000);expect(reads).toBe(14);
+  });
   it('retries failed account reads without leaving a permanent loading message', async () => {
     let reads = 0;
     const request = vi.fn(async (path: string, init?: RequestInit) => {

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { adminGroupCreateSchema, adminGroupUpdateSchema, adminLicenseAssignSchema, adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
 import { authenticationMethodRemovalSchema, authenticationMethodKindSchema, authenticationMethodIdSchema, type AuthenticationMethodRemoval, AuthenticationMethodError, createAuthenticationMethodsProvider } from './admin-auth-methods';
 import type { GuardedFetch } from './transport';
+import type { AdministrationCredentialCapture } from './admin-runtime';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const operation = z.discriminatedUnion('type', [
@@ -60,7 +61,7 @@ type Audit = {
 };
 export class AdministrationExecutionError extends Error {
   constructor(public readonly code: 'invalid_operation' | 'access_denied' | 'connection_not_ready'
-    | 'connection_changed' | 'audit_unavailable' | 'unknown_write_outcome' | 'provider_failed') { super(code); }
+    | 'connection_changed' | 'audit_unavailable' | 'credential_capture_unavailable' | 'unknown_write_outcome' | 'provider_failed') { super(code); }
 }
 
 /** Internal service, not a browser endpoint. The host must implement authorization using
@@ -69,6 +70,7 @@ export class AdministrationExecutionError extends Error {
  * must resolve the exact supplied credentialVersion; never accept a browser certificate/ref.
  * Checks fence each dispatch and response, but cannot recall an already dispatched write. */
 export function createAdministrationExecutor<Request>(ports: {
+  credentialCapture?: AdministrationCredentialCapture<Request>;
   authorize(request: Request, orgId: string, operation: AdministrationOperation['type']): Promise<{ actorId: string } | null>;
   loadConnection(request: Request, orgId: string): Promise<AdministrationConnection | null>;
   acquireToken(connection: AdministrationConnection): Promise<string>;
@@ -82,6 +84,8 @@ export function createAdministrationExecutor<Request>(ports: {
     const op = parsed.data;
     const principal = await ports.authorize(request, orgId, op.type);
     if (!principal || !uuid.safeParse(principal.actorId).success) throw new AdministrationExecutionError('access_denied');
+    if (op.type === 'user.create' && !ports.credentialCapture)
+      throw new AdministrationExecutionError('credential_capture_unavailable');
     const initial = connectionSchema.safeParse(await ports.loadConnection(request, orgId));
     if (!initial.success || initial.data.orgId !== orgId) throw new AdministrationExecutionError('connection_not_ready');
     const snapshot = Object.freeze(initial.data);
@@ -168,11 +172,34 @@ export function createAdministrationExecutor<Request>(ports: {
       },
     });
     let result: unknown;
+    let credentialPrepared = false;
     try {
       switch (op.type) {
         case 'users.list': result = await provider.listUsers(); break;
         case 'user.domains.list': result = await provider.listVerifiedUserDomains(); break;
-        case 'user.create': result = await provider.createUser(op.user, fence); break;
+        case 'user.create': {
+          const capture = ports.credentialCapture!;
+          const created = await provider.createUser({ ...op.user,
+            password: op.user.password ?? capture.generatePassword() }, fence, async input => {
+            await fence();
+            try {
+              await capture.prepare(request, { executionId: event.executionId,
+                connectionId: snapshot.id, tenantId: snapshot.tenantId,
+                username: input.userPrincipalName, password: input.password,
+                temporaryPassword: input.forceChangePasswordNextSignIn });
+              credentialPrepared = true;
+            } catch { throw new AdministrationExecutionError('credential_capture_unavailable'); }
+            await fence();
+          });
+          await fence();
+          // A verified Microsoft success is not rolled back if vault completion
+          // fails. The committed draft retains the secret; never replay creation.
+          await capture.complete(request, { executionId: event.executionId,
+            connectionId: snapshot.id, tenantId: snapshot.tenantId,
+            username: created.userPrincipalName, providerUserId: created.id });
+          result = created;
+          break;
+        }
         case 'user.license.assign': result = await provider.assignUserLicense(op.id, op.license, fence); break;
         case 'user.licenses.get': result = await provider.getUserLicenses(op.id); break;
         case 'user.license.remove': result = await provider.removeUserLicense(op.id, op.skuId, fence); break;
@@ -205,6 +232,15 @@ export function createAdministrationExecutor<Request>(ports: {
     } catch (error) {
       const providerError = error instanceof AdminGraphError || error instanceof AuthenticationMethodError;
       const unknown = dispatched && (!providerError || error.code === 'unknown_write_outcome');
+      if (op.type === 'user.create' && credentialPrepared && ports.credentialCapture?.fail) {
+        // Reconciliation metadata only: never replay Graph and never expose a
+        // sink error (which may contain database parameters) over the original.
+        try {
+          await ports.credentialCapture.fail(request, { executionId: event.executionId,
+            connectionId: snapshot.id, tenantId: snapshot.tenantId,
+            username: op.user.userPrincipalName, state: unknown ? 'unknown' : 'rejected' });
+        } catch { /* The committed draft remains pending for explicit review. */ }
+      }
       await audit('outcome', unknown ? 'unknown' : 'rejected');
       if (unknown) throw new AdministrationExecutionError('unknown_write_outcome');
       if (fenceFailure) throw fenceFailure;

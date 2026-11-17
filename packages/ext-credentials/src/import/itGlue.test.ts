@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseItGlueCsv, previewItGlue } from './itGlue';
+import { parseItGlueCsv, previewItGlue, normalizeItGlue } from './itGlue';
 
 const headers = ['id', 'organization', 'name', 'password_category', 'resource_type', 'resource_id', 'username', 'password', 'one_time_password', 'archived', 'url', 'notes', 'otp_secret', 'shareable'];
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
@@ -7,6 +7,27 @@ const record = (values: Record<string, string> = {}) => headers.map(h => quote((
 const csv = (...records: string[]) => `${headers.join(',')}\r\n${records.join('\r\n')}`;
 
 describe('IT Glue credential importer', () => {
+  it('normalizes new imports without changing secret bytes and retains uncertain rows as drafts', () => {
+    const password = '  imported, secret\r\n ';
+    const otp = ' JBSWY3DPEHPK3PXP ';
+    const result = normalizeItGlue(parseItGlueCsv(csv(
+      record({ name: '<b>Microsoft 365 tenant admin credentials</b>', password, otp_secret: otp }),
+      record({ id: '2', name: 'Unrecognized widget' }),
+      record({ id: '3', name: 'WiFi Guest', username: '' }),
+      record({ id: '4', name: 'Microsoft 365', username: '' }),
+    )));
+    expect(result[0]).toMatchObject({ name: 'Microsoft 365', category: 'Email', isAdministration: true, isDraft: false, password, otpSecret: otp });
+    expect(result[1]).toMatchObject({ disposition: 'review', isDraft: true });
+    expect(result[2]).toMatchObject({ category: 'Network / Wi-Fi', isDraft: false });
+    expect(result[3]).toMatchObject({ isDraft: true });
+  });
+  it('flags standalone secrets for Notes without dropping their source values', () => {
+    const rows = parseItGlueCsv(csv(record({ name: 'Widget API key', password: '  preserve-key  ' })));
+    expect(normalizeItGlue(rows)[0]).toMatchObject({ disposition: 'note', password: '  preserve-key  ' });
+    const preview = previewItGlue(rows);
+    expect(preview.normalization).toEqual({ credentials: 0, drafts: 0, notesRequired: 1 });
+    expect(JSON.stringify(preview)).not.toContain('preserve-key');
+  });
   it.each(['No', 'FALSE', '0', ''])('treats the IT Glue OTP flag %j as disabled', flag => {
     expect(parseItGlueCsv(csv(record({ one_time_password: flag })))[0]?.issues).not.toContain('otp_value_without_secret');
   });

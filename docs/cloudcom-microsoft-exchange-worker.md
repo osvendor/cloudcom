@@ -1,6 +1,11 @@
 # Cloud Command Exchange worker contract
 
-Status: bounded mailbox inventory, external SMTP forwarding, automatic replies, primary SMTP changes, alias add/remove, and direct mailbox delegation code paths exist in the Cloud Command extension. The worker is not deployed or enabled until the private sidecar, socket mount, descriptor mount, and Exchange app-only capability probe are validated. No live Exchange write has been tested.
+Status: the private Exchange worker is deployed. November 13, 2026 read-only
+acceptance verified BBD delegation, cached reopening, forced refresh, forwarding
+and directory/usage sync across all three enabled tenants. Mailbox inventory,
+forwarding, automatic replies, primary SMTP, aliases and direct delegation code
+paths exist. Read tests do not establish live write acceptance. The 0.129.5
+intake is a candidate and is not claimed deployed here.
 
 ## Purpose
 
@@ -44,7 +49,7 @@ Use a non-root worker user and a local Unix socket mounted only into the API con
 
 The worker's host-only tenant descriptor is a deployment binding, not a second customer setup step. The single Extensions → Connect transaction must provision or refresh it from the already verified organization connection, and disconnect or credential rotation must revoke it. A worker build that relies on manually editing a tenant JSON file is not ready for customer use. Treat write failures or uncertainty during descriptor synchronization as an Exchange capability that needs attention while leaving the Graph connection intact; never silently route to a stale tenant binding.
 
-The implementation uses `CLOUDCOM_EXCHANGE_DESCRIPTOR_FILE` and `CLOUDCOM_EXCHANGE_SOCKET_PATH` only inside the API host. When both are configured, the host creates the local descriptor from the protected Microsoft application certificate already used by Connect; it serializes atomic descriptor updates with mode `0600`. Exchange's `-Organization` value must be the tenant's initial `.onmicrosoft.com` domain, not its GUID. The API resolves that domain from Microsoft Graph `/organization` using the same tenant-bound application credential, checks the returned tenant ID and initial-domain marker, and fails descriptor provisioning closed on mismatch. The descriptor path and socket must be private shared mounts between the API and worker. The current API image runs as non-root UID `1001`; a worker using the API-written `0600` descriptor must run with that same numeric UID inside a separate container and private mount, or the descriptor format/permissions must be changed with a tested group-based model. The Unix socket broker also checks that peer UID, so its configured API username must resolve to `1001` in the worker. None of these identity or mount assumptions has been verified in a deployed worker yet. Their absence leaves Graph administration working and keeps Exchange unavailable. These settings are deployment-only and must never appear in an extension response, UI field, repository secret, or Cloudflare configuration.
+The implementation uses `CLOUDCOM_EXCHANGE_DESCRIPTOR_FILE` and `CLOUDCOM_EXCHANGE_SOCKET_PATH` only inside the API host. When both are configured, the host creates the local descriptor from the protected Microsoft application certificate already used by Connect; it serializes atomic descriptor updates with mode `0600`. Exchange's `-Organization` value must be the tenant's initial `.onmicrosoft.com` domain, not its GUID. The API resolves that domain from Microsoft Graph `/organization` using the same tenant-bound application credential, checks the returned tenant ID and initial-domain marker, and fails descriptor provisioning closed on mismatch. The descriptor path and socket must be private shared mounts between the API and worker. The current API image runs as non-root UID `1001`; a worker using the API-written `0600` descriptor must run with that same numeric UID inside a separate container and private mount, or the descriptor format/permissions must be changed with a tested group-based model. The Unix socket broker also checks that peer UID, so its configured API username must resolve to `1001` in the worker. The deployed private worker/API bridge passed November 13 read checks. Preserve these identity and mount requirements during upgrades; their absence leaves Graph administration working but Exchange unavailable. These settings are deployment-only and must never appear in an extension response, UI field, repository secret, or Cloudflare configuration.
 
 The existing Microsoft application certificate directory is mounted read-only into the API. A deployment must preserve that mount and share it read-only with the Exchange worker. It must add a *different* private read-write directory for the descriptor and Unix socket, mounted only into the API and worker. The API writes the descriptor there; the worker creates the socket there. Both processes need directory traversal and write access under the verified UID/GID model, and the worker must reject any peer other than the API UID. Do not remount the certificate directory read-write or expose either directory through the proxy.
 
@@ -55,3 +60,42 @@ Microsoft requires `Exchange.ManageAsApp` and an appropriate Exchange/Entra RBAC
 Unit tests must reject arbitrary operation names/parameters, foreign tenants, stale connection generations, mismatched certificates, overlong responses, malformed provider data and unauthorized actors. Integration tests run against a disposable worker and fake PowerShell process, then a real module canary on the Linux GIT VM. Live reads use OS CONSULTANTS first. Live writes use only isolated test mailboxes, restore captured baseline and verify it independently. Validate the signed application release, updated Compose model, socket permissions, migration state and browser controls before enabling the capability.
 
 References: [Microsoft Exchange Online PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/exchange/app-only-auth-powershell-v2), [Exchange module supported versions](https://learn.microsoft.com/en-us/powershell/exchange/exchange-online-powershell-v2), [PowerShell container guidance](https://learn.microsoft.com/en-us/powershell/scripting/install/powershell-in-docker), [Exchange Online Admin API preview status](https://learn.microsoft.com/en-us/exchange/reference/admin-api-get-started), and the retained Cloud Command `connector_broker.py` / `exchange-persistent.ps1` source (private task workspace).
+
+## Session reuse behavior (November 2026)
+Each tenant retains its own authenticated PowerShell session for five idle minutes. Mailbox inventory, delegation, forwarding, automatic replies and other supported commands reuse that session sequentially. No background keepalive runs merely to retain authentication. The pool holds at most three sessions and permits one command globally; a fourth recent tenant may wait for capacity rather than invalidating another tenant's inventory cursor. Credential or descriptor changes retire the old session before reuse. Commands retain their existing deadline and uncertain writes are never replayed.
+The worker container sets net.ipv4.tcp_syn_retries=2 to bound TCP establishment attempts against unreachable addresses. This is container-scoped and does not replace endpoint/network diagnosis. November 12 initial-connection failures were not reproduced in the November 13 BBD read acceptance: delegation, immediate cached reopening, manual force refresh and forwarding succeeded. This does not establish the cause of the earlier connectivity failure or certify writes.
+
+## Cached menus and scheduled refresh
+
+The November 12 deployed scheduler targets directory refresh every 15 minutes
+and usage every six hours, with two tenants sequentially per sweep, freshness/
+cooldown checks and tenant-bound leases. Metadata-only refresh avoids statistics
+and reports. Encrypted Redis mailbox results have five-minute freshness and
+one-hour retention, per-key/global refresh leases, manual force refresh,
+last-good retention on failure and epoch invalidation around writes. Fresh state
+is required before edits. This supersedes explicit-only refresh, not permission
+checks or the ban on retrying uncertain writes.
+
+Candidate 0.129.5 must preserve M365 socket-owner placement despite upstream
+moving other workers global: its socket/certificate bindings remain API-private.
+Retain five-minute idle reuse, three sessions, one active command, one-core CPU
+ceiling and private mounts. Re-run broker/cache/placement contracts and live
+read acceptance before claiming candidate deployment or health.
+### Exchange and full-sync acceptance — 2026-11-13
+
+BBD delegation succeeded in about 13 seconds; reopening immediately returned the
+saved result, manual force refresh succeeded in about 6.5 seconds, and forwarding
+read in about 1.5 seconds. Audit outcomes corroborated the UI. No mailbox writes
+or service/configuration changes were performed during these checks.
+
+Normal full refresh completed directory and usage snapshots for LEASE (36
+mailboxes), OS CONSULTANTS (30) and BBD (83): 149 total. Leases released and all
+mailbox sizes were available; one OS CONSULTANTS archive statistic remained
+unavailable. Existing sequential scheduling/cooldowns took about 15 minutes.
+Across 185 five-second samples, host busy averaged 27.13% (maximum 49.62%), steal
+peaked at 0.05%, and Exchange averaged 4.47% of one core (maximum 74.47%). Worker
+throttling totaled 884 ms; API/PostgreSQL/Redis had none. API readiness remained
+202/202, mostly one or two active DB connections, briefly four, with no observed
+pool saturation. Evidence: control-plane
+`cloudcom-release-evidence/m365-full-sync-20261113.json`. These historical readings
+are not proof of acceptance/deployment of candidate 0.129.5 or all Exchange writes.

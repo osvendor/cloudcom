@@ -74,7 +74,7 @@ import {
 } from './autoMigrate';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getTableConfig } from 'drizzle-orm/pg-core';
@@ -856,10 +856,15 @@ describe('migration filename conventions', () => {
           continue;
         }
         const contents = readFileSync(full, 'utf8');
-        for (const match of contents.matchAll(/migrations\/(\d{4}-[A-Za-z0-9._-]*\.sql)/g)) {
-          const filename = match[1];
-          if (filename && !referenced.has(filename)) {
-            referenced.set(filename, path.relative(REPO_ROOT, full));
+        for (const match of contents.matchAll(/(?:(ext-[A-Za-z0-9_-]+)\/)?migrations\/(\d{4}-[A-Za-z0-9._-]*\.sql)/g)) {
+          const filename = match[2];
+          // Real extension migration fixtures also appear in API integration
+          // tests. Validate their package path instead of treating them as core.
+          const target = match[1]
+            ? path.join(REPO_ROOT, 'packages', match[1], 'migrations', filename!)
+            : path.join(MIGRATIONS_DIR, filename!);
+          if (filename && !referenced.has(target)) {
+            referenced.set(target, path.relative(REPO_ROOT, full));
           }
         }
       }
@@ -868,10 +873,9 @@ describe('migration filename conventions', () => {
 
     expect(referenced.size).toBeGreaterThan(0);
 
-    const onDisk = new Set(readdirSync(MIGRATIONS_DIR));
     const dangling = [...referenced.entries()]
-      .filter(([filename]) => !onDisk.has(filename))
-      .map(([filename, source]) => `${filename} (referenced from ${source})`);
+      .filter(([target]) => !existsSync(target))
+      .map(([target, source]) => `${path.relative(REPO_ROOT, target)} (referenced from ${source})`);
 
     expect(
       dangling,

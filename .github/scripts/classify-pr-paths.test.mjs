@@ -10,6 +10,15 @@ import { test } from 'node:test';
 // green; anything that weakens the classifier must fail closed (red), never
 // open (green with nothing run).
 
+// Deliberately omit the QEMU list: these harnesses retain its fail-closed behavior.
+function copyPolicyFiles(dir) {
+  mkdirSync(join(dir, '.github/scripts'), { recursive: true });
+  for (const file of ['classify-pr-paths.sh', 'integration-floor-paths.txt', 'path-reader-map.txt']) {
+    const source = new URL(`./${file}`, import.meta.url);
+    if (existsSync(source)) copyFileSync(source, join(dir, '.github/scripts', file));
+  }
+}
+
 const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
 const job = (name) => {
   const match = workflow.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'));
@@ -17,6 +26,11 @@ const job = (name) => {
   return match[1];
 };
 const summary = job('ci-success');
+// W05 (#10749): a job CI Success has a thin `case` arm for may end its `if:` with the
+// clause naming its own id; nothing else may follow the gates pinned here.
+const thinArms = new Set([...summary.matchAll(/^ {14}([a-z0-9-]+)\) \[\[ "\$\{\w+_RESULT\}" != "skipped" \]\] \|\| \w+_RESULT=success ;;$/gmu)].map((m) => m[1]));
+const thinOpt = (name) => (thinArms.has(name)
+  ? `(?: && !contains\\(needs\\.changes\\.outputs\\.thin_skip, ',${name},'\\))?` : '');
 const classify = (paths) =>
   spawnSync('bash', [new URL('./classify-pr-paths.sh', import.meta.url).pathname], {
     encoding: 'utf8',
@@ -32,17 +46,24 @@ test('classifier: docs-only path sets report code=false docs=true agent=false ap
   ]) {
     const run = classify(paths);
     assert.equal(run.status, 0, run.stderr);
-    assert.equal(run.stdout.trim(), 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false', paths.join(', '));
+    const readers = paths.includes('apps/docs/src/content/docs/agent.mdx')
+      ? 'apps/api/src/config/redisEvictionPolicyDocs.test.ts apps/web/src/lib/__tests__/alertingDocs.test.ts'
+      : paths.includes('README.md')
+        ? 'apps/api/src/db/bootstrapDocs.test.ts'
+        : paths.includes('apps/docs/astro.config.mjs')
+          ? 'apps/web/src/components/devices/hardware/hardwareMonitoringDocs.test.ts apps/web/src/components/devices/time/timeSyncDocs.test.ts apps/web/src/lib/__tests__/alertingDocs.test.ts'
+          : '';
+    assert.equal(run.stdout.trim(), 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=false\npath_readers=' + (readers ? 'true' : 'false') + '\nreader_tests=' + readers, paths.join(', '));
   }
 });
 
 test('classifier: any non-docs path reports code=true; docs=true only when a docs path is present', () => {
   for (const [paths, expected] of [
-    [['apps/api/src/index.ts'], 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false'],
-    [['README.md', 'apps/web/src/App.tsx'], 'code=true\ndocs=true\nagent=false\napp=true\napi=true\nweb=true\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false'],
-    [['docs/guide.md', '.github/workflows/ci.yml'], 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true'],
-    [['apps/mobile/docs.md.bak'], 'code=true\ndocs=false\nagent=false\napp=true\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=true'],
-    [['packages/shared/src/markdown/render.ts'], 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=false\nendpoint=true'],
+    [['apps/api/src/index.ts'], 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=true\npath_readers=false\nreader_tests='],
+    [['README.md', 'apps/web/src/App.tsx'], 'code=true\ndocs=true\nagent=false\napp=true\napi=true\nweb=true\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=true\npath_readers=true\nreader_tests=apps/api/src/db/bootstrapDocs.test.ts'],
+    [['docs/guide.md', '.github/workflows/ci.yml'], 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=false\nreader_tests='],
+    [['apps/mobile/docs.md.bak'], 'code=true\ndocs=false\nagent=false\napp=true\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=true\npath_readers=false\nreader_tests='],
+    [['packages/shared/src/markdown/render.ts'], 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=false\ntopology_browser=false\nagent_code=true\nintegration=true\npath_readers=false\nreader_tests='],
   ]) {
     const run = classify(paths);
     assert.equal(run.status, 0, run.stderr);
@@ -53,7 +74,7 @@ test('classifier: any non-docs path reports code=true; docs=true only when a doc
 test('classifier: an empty file list fails closed to code=true docs=true agent=true app=true', () => {
   const run = classify([]);
   assert.equal(run.status, 0, run.stderr);
-  assert.equal(run.stdout.trim(), 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true');
+  assert.equal(run.stdout.trim(), 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=true\nreader_tests=');
   assert.match(run.stderr, /fail-closed/u);
 });
 
@@ -70,10 +91,12 @@ test('classifier: app output — the CI-plumbing allowlist is app=false, everyth
     // Explicit exceptions carved OUT of the allowlist → app=true
     [['.github/workflows/ci.yml'], 'app=true'],
     [['.github/scripts/classify-pr-paths.sh'], 'app=true'],
-    // prepare-ci-apt-sources.mjs is consumed by rust-check and
-    // guided-setup-smoke (both HEAVY jobs, not lint/check-migrations/
-    // security-audit), so it must not fast-track past the app gate.
+    // prepare-ci-apt-sources.mjs is consumed by guided-setup-smoke (a HEAVY
+    // job, not lint/check-migrations/security-audit), so it must not fast-track
+    // past the app gate.
     [['.github/scripts/prepare-ci-apt-sources.mjs'], 'app=true'],
+    // tauri-apt.sh installs rust-check's system dependencies.
+    [['.github/scripts/tauri-apt.sh'], 'app=true'],
     // check-agent-binary-signatures.sh is consumed by build-agent (a HEAVY
     // job), so it must not fast-track past the app gate either.
     [['scripts/security/check-agent-binary-signatures.sh'], 'app=true'],
@@ -171,7 +194,7 @@ test('classifier: a docs file under the topology directory is still docs-only', 
   // web app, which is meaningless on a PR the code jobs skip entirely.
   const run = classify(['apps/web/src/components/topology/README.md']);
   assert.equal(run.status, 0, run.stderr);
-  assert.equal(run.stdout.trim(), 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false');
+  assert.equal(run.stdout.trim(), 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=false\npath_readers=false\nreader_tests=');
 });
 
 // ─── merge_group classification ──────────────────────────────────────
@@ -191,7 +214,7 @@ const runClassifier = (env, { seed } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), 'classify-mg-'));
   try {
     mkdirSync(join(dir, '.github/scripts'), { recursive: true });
-    copyFileSync(new URL('./classify-pr-paths.sh', import.meta.url), join(dir, '.github/scripts/classify-pr-paths.sh'));
+    copyPolicyFiles(dir);
     const git = (...args) => {
       const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
       assert.equal(r.status, 0, r.stderr);
@@ -238,7 +261,7 @@ test('merge_group: a docs-only entry is classified docs-only', () => {
     { seed: { 'docs/guide.md': 'a\n', 'apps/docs/src/content/docs/agent.mdx': 'b\n', 'README.md': 'c\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false');
+  assert.equal(output, 'code=false\ndocs=true\nagent=false\napp=false\napi=false\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=false\npath_readers=true\nreader_tests=apps/api/src/config/redisEvictionPolicyDocs.test.ts apps/api/src/db/bootstrapDocs.test.ts apps/web/src/lib/__tests__/alertingDocs.test.ts');
 });
 
 test('merge_group: a mixed entry is classified as code', () => {
@@ -247,7 +270,7 @@ test('merge_group: a mixed entry is classified as code', () => {
     { seed: { 'docs/guide.md': 'a\n', 'apps/api/src/index.ts': 'b\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=true\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false');
+  assert.equal(output, 'code=true\ndocs=true\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=true\npath_readers=false\nreader_tests=');
 });
 
 test('merge_group: a code-only entry is classified as code', () => {
@@ -256,7 +279,7 @@ test('merge_group: a code-only entry is classified as code', () => {
     { seed: { 'apps/api/src/index.ts': 'b\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nendpoint=false');
+  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=false\nintegration=true\npath_readers=false\nreader_tests=');
 });
 
 test('merge_group: a topology-browser entry turns the production-browser gate on', () => {
@@ -265,7 +288,7 @@ test('merge_group: a topology-browser entry turns the production-browser gate on
     { seed: { 'apps/web/src/components/topology/layout.worker.ts': 'b\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=true\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=true\nendpoint=false');
+  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=true\napi=true\nweb=true\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=true\nagent_code=false\nintegration=true\npath_readers=false\nreader_tests=');
 });
 
 test('merge_group: an agent-only entry is classified as code and agent', () => {
@@ -274,7 +297,7 @@ test('merge_group: an agent-only entry is classified as code and agent', () => {
     { seed: { 'agent/internal/foo.go': 'b\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=false\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=false\nendpoint=true');
+  assert.equal(output, 'code=true\ndocs=false\nagent=true\napp=true\napi=true\nweb=false\nportal=false\naddins=false\nm365=false\nrust=false\ntopology_browser=false\nagent_code=true\nintegration=true\npath_readers=false\nreader_tests=');
 });
 
 test('merge_group: a tooling-only entry is classified as code but not app', () => {
@@ -283,7 +306,7 @@ test('merge_group: a tooling-only entry is classified as code but not app', () =
     { seed: { 'scripts/security/check-npm-audit.sh': 'a\n', '.github/workflows/release.yml': 'b\n' } },
   );
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=false\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=false\nendpoint=true');
+  assert.equal(output, 'code=true\ndocs=false\nagent=false\napp=false\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=false\nagent_code=true\nintegration=true\npath_readers=false\nreader_tests=');
 });
 
 test('merge_group: an unresolvable base sha fails safe to the full suite', () => {
@@ -295,21 +318,21 @@ test('merge_group: an unresolvable base sha fails safe to the full suite', () =>
   ]) {
     const { execution, output } = runClassifier(env, { seed: { 'docs/guide.md': 'a\n' } });
     assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-    assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true', JSON.stringify(env));
+    assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=true\nreader_tests=', JSON.stringify(env));
   }
 });
 
 test('merge_group: an empty diff fails closed to the full suite', () => {
   const { execution, output } = runClassifier({ EVENT_NAME: 'merge_group' });
   assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-  assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true');
+  assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=true\nreader_tests=');
 });
 
 test('workflow_dispatch and any other event still run the full suite', () => {
   for (const EVENT_NAME of ['workflow_dispatch', 'push', 'schedule']) {
     const { execution, output } = runClassifier({ EVENT_NAME }, { seed: { 'docs/guide.md': 'a\n' } });
     assert.equal(execution.status, 0, execution.stdout + execution.stderr);
-    assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true', EVENT_NAME);
+    assert.equal(output, 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=true\nreader_tests=', EVENT_NAME);
   }
 });
 
@@ -336,9 +359,15 @@ test('every code job is gated on the classifier', () => {
   const jobs = [...workflow.slice(workflow.indexOf('\njobs:\n')).matchAll(/^  ([a-z][\w-]*):$/gmu)].map((m) => m[1]);
   assert.ok(jobs.length > 35, 'job parser is stale');
   const exempt = new Set([
+    'path-read-contracts', // gated on path_readers, independent of code; pinned in ci-pr-selection.test.mjs
     'changes', // the classifier itself
     'ci-success', // must report on docs-only PRs — that is the whole point
-    'main-red-alert', // workflow_dispatch on main only
+    'main-red-alert', // workflow_dispatch and the nightly schedule on main only
+    // W4 (#10748): advisory provenance written after a green CI Success on any PR
+    // (docs-only included); continue-on-error, never a gate. Pinned in queue-selection.test.mjs.
+    'provenance-record',
+    // W02 (#10746): dispatch-only replay of the gate verdict; never a gate. Pinned in ci-gate.test.mjs.
+    'ci-gate-replay',
     'docs-check', // gated on the `docs` output instead — it is the one job a docs-only PR must run
     'build-mobile-ios', // inherits the gate through mobile-native-changes (pinned by mobile-native-ci.test.mjs)
     'recovery-media-e2e', // compound gate (code AND agent) — asserted separately below
@@ -356,7 +385,7 @@ test('every code job is gated on the classifier', () => {
   // Per-area jobs carry an extra area clause AFTER the code/app gate; the exact
   // per-area `if:` lines are pinned by ci-area-gating.test.mjs. The prefix is
   // still required here, so a docs-only or tooling-only PR still skips them.
-  const areaGated = /^    if: needs\.changes\.outputs\.code == 'true' && needs\.changes\.outputs\.app == 'true' && (needs\.changes\.outputs\.(api|web|portal|addins|m365|rust|endpoint) == 'true'|\(needs\.changes\.outputs\.api == 'true' \|\| needs\.changes\.outputs\.web == 'true' \|\| needs\.changes\.outputs\.portal == 'true'\))$/mu;
+  const areaGated = (name) => new RegExp(`^    if: needs\\.changes\\.outputs\\.code == 'true' && needs\\.changes\\.outputs\\.app == 'true' && (needs\\.changes\\.outputs\\.(api|web|portal|addins|m365|rust|integration|agent_code) == 'true'|\\(needs\\.changes\\.outputs\\.api == 'true' \\|\\| needs\\.changes\\.outputs\\.web == 'true' \\|\\| needs\\.changes\\.outputs\\.portal == 'true'\\))${thinOpt(name)}$`, 'mu');
   for (const name of jobs) {
     if (exempt.has(name)) continue;
     const body = job(name);
@@ -364,14 +393,14 @@ test('every code job is gated on the classifier', () => {
     if (name === 'check-migrations') {
       // code AND api, never app: it is the release-lineage guard for tooling-only PRs.
       assert.match(body, /^    if: needs\.changes\.outputs\.code == 'true' && needs\.changes\.outputs\.api == 'true'$/mu, name);
-    } else if (areaGated.test(body)) {
+    } else if (areaGated(name).test(body)) {
       continue;
     } else if (codeOnly.has(name)) {
       assert.match(body, /^    if: needs\.changes\.outputs\.code == 'true'$/mu, `${name} must be skipped on a docs-only PR, and stay code-only (not app-gated)`);
     } else {
       assert.match(
         body,
-        /^    if: needs\.changes\.outputs\.code == 'true' && needs\.changes\.outputs\.app == 'true'$/mu,
+        new RegExp(`^    if: needs\\.changes\\.outputs\\.code == 'true' && needs\\.changes\\.outputs\\.app == 'true'${thinOpt(name)}$`, 'mu'),
         `${name} must be skipped on a docs-only OR tooling-only PR`,
       );
     }
@@ -395,7 +424,7 @@ test('the topology production-browser gate is gated on its own classifier output
   assert.match(body, /--config=playwright\.topology-worker\.config\.ts --project=chromium/u);
   assert.match(job('changes'), /^      topology_browser: \$\{\{ steps\.classify\.outputs\.topology_browser \}\}$/mu);
   // Fail-safe: the merge-group fallback must turn the gate ON, never off.
-  assert.match(job('changes'), /printf 'code=true\\ndocs=true\\nagent=true\\napp=true\\napi=true\\nweb=true\\nportal=true\\naddins=true\\nm365=true\\nrust=true\\ntopology_browser=true\\nendpoint=true\\n'/u);
+  assert.match(job('changes'), /printf 'code=true\\ndocs=true\\nagent=true\\napp=true\\napi=true\\nweb=true\\nportal=true\\naddins=true\\nm365=true\\nrust=true\\ntopology_browser=true\\nagent_code=true\\nintegration=true\\npath_readers=true\\nreader_tests=\\n'/u);
   assert.match(summary, /TOPOLOGY_BROWSER_CHANGED: \$\{\{ needs\.changes\.outputs\.topology_browser \}\}/u);
   assert.match(summary, /TOPOLOGY_BROWSER_GATE_RESULT: \$\{\{ needs\.topology-browser-gate\.result \}\}/u);
 });
@@ -437,12 +466,15 @@ test('test-api has an 8-way shard matrix', () => {
   const body = job('test-api');
   assert.match(body, /^    name: Test API \(shard \$\{\{ matrix\.shard \}\}\/8\)$/mu);
   assert.match(body, /^    strategy:\n      fail-fast: false\n      matrix:\n        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/mu);
-  assert.match(body, /^    timeout-minutes: 30$/mu);
+  // Room for a whole-shard retry (W1, #10744): 2 × 11.7 min slowest step + setup.
+  assert.match(body, /^    timeout-minutes: 40$/mu);
 });
 
 test('test-api runs the main vitest split with --shard and no bare "--"', () => {
   const step = testApiStep('Run API tests');
-  assert.match(step, /run: pnpm --filter=@breeze\/api test:run --shard=\$\{\{ matrix\.shard \}\}\/8$/mu);
+  // Wrapped by the whole-shard retry (W1, #10744); the wrapper's own `--` sits
+  // before pnpm, so pnpm still forwards --shard to vitest.
+  assert.match(step, /run: node \.github\/scripts\/retry-shard\.mjs --runner vitest --label api-\$\{\{ matrix\.shard \}\} --budget-minutes 35 -- pnpm --filter=@breeze\/api test:run --shard=\$\{\{ matrix\.shard \}\}\/8$/mu);
   assert.doesNotMatch(step, /pnpm --filter=@breeze\/api test:run -- /u, 'a bare "--" makes pnpm forward it literally and vitest silently ignores --shard');
 });
 
@@ -486,8 +518,9 @@ test('integration-test has a 16-way shard matrix and does not wait on lint/typec
   // `needs:` YAML line (as opposed to a doesNotMatch scan, which would also
   // trip on this test's own explanatory comment mentioning them by name).
   assert.match(body, /^    needs: \[changes\]$/mu, 'integration-test must not needs: lint or typecheck — that added ~8 min to the critical path and a lint failure still fails CI Success via ci-success');
-  assert.match(body, /^    timeout-minutes: 40$/mu);
-  assert.match(body, /run: pnpm --filter=@breeze\/api test:integration --shard=\$\{\{ matrix\.shard \}\}\/16$/mu);
+  // Room for a whole-shard retry (W1, #10744): 2 × 24.3 min slowest step + setup.
+  assert.match(body, /^    timeout-minutes: 55$/mu);
+  assert.match(body, /run: node \.github\/scripts\/retry-shard\.mjs --runner vitest --label integration-\$\{\{ matrix\.shard \}\} --budget-minutes 50 -- pnpm --filter=@breeze\/api test:integration --shard=\$\{\{ matrix\.shard \}\}\/16$/mu);
 });
 
 // Execute the real summary shell. The bypass may only fire on the literal
@@ -498,11 +531,15 @@ const summaryScript = summary.split('        run: |\n')[1]
 const resultVars = [...summary.matchAll(/^          (\w+_RESULT):/gmu)].map((m) => m[1]);
 const allOf = (value) => Object.fromEntries(resultVars.map((v) => [v, value]));
 const passing = {
-  ...allOf('success'), MOBILE_NATIVE_REQUIRED: 'false', BUILD_MOBILE_IOS_RESULT: 'skipped', AGENT_CHANGED: 'true', ENDPOINT_CHANGED: 'true', APP_CHANGED: 'true',
+  AGENT_CODE_CHANGED: 'true',
+  PATH_READERS_CHANGED: 'true',
+  ...allOf('success'), MOBILE_NATIVE_REQUIRED: 'false', BUILD_MOBILE_IOS_RESULT: 'skipped', AGENT_CHANGED: 'true', APP_CHANGED: 'true',
   // Every per-area flag true: the per-area tri-state lives in ci-area-gating.test.mjs.
   API_CHANGED: 'true', WEB_CHANGED: 'true', PORTAL_CHANGED: 'true', ADDINS_CHANGED: 'true', M365_CHANGED: 'true', RUST_CHANGED: 'true',
+  INTEGRATION_CHANGED: 'true',
 };
 const docsOnlySkipped = {
+  PATH_READERS_CHANGED: 'false',
   ...allOf('skipped'), CHANGES_RESULT: 'success', MOBILE_NATIVE_REQUIRED: '', AGENT_CHANGED: '', DOCS_CHANGED: 'true', DOCS_CHECK_RESULT: 'success',
 };
 
@@ -567,6 +604,8 @@ const heavyResultVars = [
   'AUTH_BROWSER_TRANSITION_BROWSER_CONTRACT_RESULT',
 ];
 const toolingOnlyPassing = {
+  AGENT_CODE_CHANGED: 'true',
+  PATH_READERS_CHANGED: 'false',
   ...allOf('skipped'), // everything defaults to skipped for a tooling-only PR...
   ...Object.fromEntries(['LINT_RESULT', 'RELEASE_LEDGER_RESULT', 'CHECK_MIGRATIONS_RESULT', 'SECURITY_AUDIT_RESULT'].map((v) => [v, 'success'])),
   CHANGES_RESULT: 'success',
@@ -658,6 +697,10 @@ for (const path of [
   '.github/scripts/mobile-native-ci.test.mjs',
   // its drift test (agent/cmd/breeze-backup/ci_gate_test.go) runs in test-agent.
   '.github/scripts/qemu-gate-paths.txt',
+  // apps/api/vitest.integration.config.ts imports it: it shards integration-test (W07a, #10751).
+  '.github/scripts/shard-partition.mjs',
+  // ...and typecheck (tsconfig.tests.json) checks that import against these types.
+  '.github/scripts/shard-partition.d.mts',
 ]) {
   test(`classifier: ${path} is executed by a heavy job, so it is an app change`, () => {
     const r = classify([path]);
@@ -674,8 +717,11 @@ test('every explicit app=true carve-out in the classifier is still referenced by
     '.github/workflows/ci.yml',
     '.github/scripts/classify-pr-paths.sh',
     '.github/scripts/prepare-ci-apt-sources.mjs',
+    '.github/scripts/tauri-apt.sh',
     '.github/scripts/mobile-native-ci.test.mjs',
     '.github/scripts/qemu-gate-paths.txt',
+    '.github/scripts/shard-partition.mjs',
+    '.github/scripts/shard-partition.d.mts',
     'scripts/security/check-agent-binary-signatures.sh',
     'scripts/release/verify-release-images.sh',
   ]) {
@@ -683,6 +729,8 @@ test('every explicit app=true carve-out in the classifier is still referenced by
   }
   const smoke = readFileSync(new URL('../../scripts/smoke-guided-setup.sh', import.meta.url), 'utf8');
   assert.ok(smoke.includes('scripts/release/verify-release-images.sh'));
+  const integrationConfig = readFileSync(new URL('../../apps/api/vitest.integration.config.ts', import.meta.url), 'utf8');
+  assert.ok(integrationConfig.includes("from '../../.github/scripts/shard-partition.mjs'"));
 });
 
 test('the tooling-only path still validates workflow files: lint runs the workflow-security suite', () => {
@@ -776,3 +824,302 @@ test('docs-check runs the customer-PII guard: it scans docs, so a docs-only PR m
   assert.ok(docsCheck.indexOf('check-customer-pii.sh') < docsCheck.indexOf('pnpm --filter @breeze/docs check'));
 });
 
+// ---- Agent area output and fail-open fallback ------------------------------
+test('classifier: agent_code includes agent paths, CI, and unknown paths', () => {
+  for (const [paths, want] of [
+    [['agent/internal/logging/logging.go'], 'true'],
+    // agent/ path outside the QEMU gate: agent=false but agent_code=true
+    [['agent/internal/heartbeat/x.go'], 'true'],
+    [['.github/workflows/ci.yml'], 'true'],
+    [['.github/scripts/classify-pr-paths.sh'], 'true'],
+    [['apps/api/src/index.ts', 'agent/go.mod'], 'true'],
+    [['apps/api/src/index.ts'], 'false'],
+    [['docs/guide.md'], 'false'],
+    [['.github/workflows/release.yml'], 'true'],
+    // agent markdown is documentation (no Go changed), even alongside code
+    [['apps/api/x.ts', 'agent/README.md'], 'false'],
+    [[], 'true'], // fail-closed on an empty list
+  ]) {
+    const run = classify(paths);
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, new RegExp(`^agent_code=${want}$`, 'm'), paths.join(', '));
+  }
+});
+
+test('changes job exposes agent_code and the merge-group fallback turns it on', () => {
+  const body = job('changes');
+  assert.match(body, /^      agent_code: \$\{\{ steps\.classify\.outputs\.agent_code \}\}$/mu);
+  assert.match(body, /topology_browser=true\\nagent_code=true\\nintegration=true\\npath_readers=true\\nreader_tests=\\n' \| tee/u);
+  assert.match(summary, /AGENT_CODE_CHANGED: \$\{\{ needs\.changes\.outputs\.agent_code \}\}/u);
+});
+
+// Agent-area tri-state and waiver retirement are covered by ci-pr-selection.test.mjs.
+
+// ---- #5936: integration-test path gate (pull_request only) -------------------
+// `integration=true` runs the 16-shard real-Postgres suite. It is path-gated ONLY
+// when the classifier is told the list is a pull_request diff (`--pull-request`);
+// every other caller — the merge queue above all — gets integration=true for any
+// code change. The PR gate itself fails OPEN: only paths the suite provably cannot
+// read (agent/, the web/portal/viewer/helper/mobile apps, the add-ins, the M365
+// executors, the root Rust manifests) are false; everything else, including any
+// path no rule names, is true. The dependency evidence is re-derived from the
+// suite's sources by ci-area-gating.test.mjs.
+const classifyPr = (paths) =>
+  spawnSync('bash', [new URL('./classify-pr-paths.sh', import.meta.url).pathname, '--pull-request'], {
+    encoding: 'utf8',
+    input: paths.join('\n') + (paths.length ? '\n' : ''),
+  });
+const integrationLine = (run) => run.stdout.trim().split('\n').find((l) => l.startsWith('integration='));
+
+for (const [label, paths, want] of [
+  // Cannot affect the integration suite → false on a PR.
+  ['agent-only', ['agent/internal/heartbeat/heartbeat.go', 'agent/go.mod'], 'false'],
+  ['web-only', ['apps/web/src/components/Foo.tsx'], 'false'],
+  ['web package.json', ['apps/web/package.json'], 'true'],
+  ['portal-only', ['apps/portal/src/pages/index.astro'], 'false'],
+  ['viewer-only', ['apps/viewer/src/lib/protocol.ts', 'apps/viewer/src-tauri/src/main.rs'], 'false'],
+  ['helper-only', ['apps/helper/src-tauri/src/main.rs'], 'false'],
+  ['mobile-only', ['apps/mobile/src/App.tsx'], 'false'],
+  ['mobile package.json (install input)', ['apps/mobile/package.json'], 'true'],
+  ['add-in-only', ['apps/excel-addin/src/x.ts', 'apps/outlook-addin/src/x.ts'], 'false'],
+  ['m365-executor-only', ['apps/m365-graph-read-executor/src/index.ts', 'apps/m365-communications-executor/Dockerfile'], 'false'],
+  ['root Rust manifests', ['Cargo.lock', 'rust-toolchain.toml'], 'false'],
+  ['docs-only', ['docs/guide.md', 'apps/api/README.md'], 'false'],
+  ['web + agent + docs', ['apps/web/src/a.tsx', 'agent/cmd/breeze-agent/main.go', 'README.md'], 'false'],
+  // Can affect it → true.
+  ['api source', ['apps/api/src/services/foo.ts'], 'true'],
+  ['api migration', ['apps/api/migrations/2026-10-01-x.sql'], 'true'],
+  ['api scripts the suite imports (topology-migrate, labour-pricing)', ['apps/api/scripts/topology-migrate.ts'], 'true'],
+  ['an *.integration.test.ts', ['apps/api/src/services/contractRenewal.integration.test.ts'], 'true'],
+  ['integration config', ['apps/api/vitest.integration.config.ts'], 'true'],
+  ['shared package (fixtures the suite imports)', ['packages/shared/src/fixtures/scanPath.json'], 'true'],
+  ['any package', ['packages/extension-sdk/src/index.ts'], 'true'],
+  ['ee extension (booted + integration-tested in the job)', ['ee/workspace/src/index.ts'], 'true'],
+  ['lockfile', ['pnpm-lock.yaml'], 'true'],
+  ['root package.json', ['package.json'], 'true'],
+  ['workspace manifest', ['pnpm-workspace.yaml'], 'true'],
+  ['patches', ['patches/foo@1.0.0.patch'], 'true'],
+  ['root tsconfig', ['tsconfig.base.json'], 'true'],
+  ['ci.yml', ['.github/workflows/ci.yml'], 'true'],
+  ['the classifier', ['.github/scripts/classify-pr-paths.sh'], 'true'],
+  ['any .github/scripts file', ['.github/scripts/ci-build-reuse.test.mjs'], 'true'],
+  ['test-stack compose file', ['docker-compose.test.yml'], 'true'],
+  ['docker dir', ['docker/Dockerfile.api'], 'true'],
+  ['root Dockerfile', ['Dockerfile.api'], 'true'],
+  ['e2e-tests (no rule names it: fail open)', ['e2e-tests/tests/login.spec.ts'], 'true'],
+  ['unknown top-level path (fail open)', ['some-new-top-level-dir/x.ts'], 'true'],
+  ['unknown new app (fail open)', ['apps/some-new-app/src/index.ts'], 'true'],
+  ['web-only plus one api file', ['apps/web/src/a.tsx', 'apps/api/src/index.ts'], 'true'],
+  ['a rename out of api into web lists both paths', ['apps/web/src/moved.ts', 'apps/api/src/moved.ts'], 'true'],
+  ['unresolvable: an empty list', [], 'true'],
+]) {
+  test(`classifier --pull-request: ${label} → integration=${want}`, () => {
+    const run = classifyPr(paths);
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(integrationLine(run), `integration=${want}`, paths.join(', '));
+  });
+}
+
+test('classifier: without --pull-request, integration is ungated (true for any code change)', () => {
+  for (const paths of [
+    ['agent/internal/heartbeat/heartbeat.go'],
+    ['apps/web/src/components/Foo.tsx'],
+    ['apps/mobile/src/App.tsx'],
+    ['apps/excel-addin/src/x.ts'],
+    ['.github/workflows/release.yml'],
+    [],
+  ]) {
+    const run = classify(paths);
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(integrationLine(run), 'integration=true', paths.join(', ') || '(empty)');
+  }
+  // A docs-only list is still integration=false: integration implies code, like topology_browser.
+  assert.equal(integrationLine(classify(['docs/guide.md'])), 'integration=false');
+});
+
+test('classifier: --pull-request changes ONLY the integration output', () => {
+  const strip = (run) => run.stdout.trim().split('\n').filter((l) => !l.startsWith('integration=')).join('\n');
+  for (const paths of [['apps/web/src/a.tsx'], ['agent/go.mod'], ['apps/mobile/src/App.tsx'], ['apps/api/src/x.ts'], ['docs/a.md'], []]) {
+    assert.equal(strip(classifyPr(paths)), strip(classify(paths)), paths.join(', '));
+  }
+});
+
+test('classifier: an unknown argument is an error (fails the changes job closed)', () => {
+  const run = spawnSync('bash', [new URL('./classify-pr-paths.sh', import.meta.url).pathname, '--pr'], {
+    encoding: 'utf8', input: 'apps/web/src/a.tsx\n',
+  });
+  assert.notEqual(run.status, 0);
+});
+
+test('merge_group: the integration gate is NOT applied — web/agent/mobile/add-in-only entries run the full suite', () => {
+  for (const seed of [
+    { 'apps/web/src/components/Foo.tsx': 'a\n' },
+    { 'agent/internal/heartbeat/heartbeat.go': 'a\n' },
+    { 'apps/mobile/src/App.tsx': 'a\n' },
+    { 'apps/excel-addin/src/x.ts': 'a\n' },
+  ]) {
+    const { execution, output } = runClassifier({ EVENT_NAME: 'merge_group' }, { seed });
+    assert.equal(execution.status, 0, execution.stdout + execution.stderr);
+    assert.match(output, /^integration=true$/mu, Object.keys(seed).join(','));
+  }
+});
+
+// Drive the pull_request branch of the real changes step with a stubbed `gh` that
+// serves the PR's file list, proving the PR path (and only it) passes --pull-request.
+const runPrClassifier = (files) => {
+  const dir = mkdtempSync(join(tmpdir(), 'classify-pr-'));
+  try {
+    mkdirSync(join(dir, '.github/scripts'), { recursive: true });
+    mkdirSync(join(dir, 'bin'));
+    copyPolicyFiles(dir);
+    writeFileSync(join(dir, 'bin/gh'), `#!/usr/bin/env bash\nprintf '%s\\n' ${files.map((f) => `'${f}'`).join(' ')}\n`, { mode: 0o755 });
+    const outputFile = join(dir, 'gh-output');
+    writeFileSync(outputFile, '');
+    const execution = spawnSync('bash', ['-c', classifyScript], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
+        GITHUB_OUTPUT: outputFile,
+        GITHUB_REPOSITORY: 'LanternOps/breeze',
+        EVENT_NAME: 'pull_request',
+        PR_NUMBER: '1',
+      },
+    });
+    return { execution, output: readFileSync(outputFile, 'utf8').trim() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+test('pull_request: the changes step path-gates integration', () => {
+  for (const [files, want] of [
+    [['apps/web/src/components/Foo.tsx'], 'false'],
+    [['agent/internal/heartbeat/heartbeat.go'], 'false'],
+    [['apps/api/src/index.ts'], 'true'],
+    [['apps/api/migrations/2026-10-01-x.sql'], 'true'],
+  ]) {
+    const { execution, output } = runPrClassifier(files);
+    assert.equal(execution.status, 0, execution.stdout + execution.stderr);
+    assert.match(output, new RegExp(`^integration=${want}$`, 'mu'), files.join(','));
+    assert.match(output, /^code=true$/mu);
+  }
+  // The merge-group call must NOT pass the flag.
+  assert.match(classifyScript, /printf '%s\\n' "\$\{changed\}" \| bash \.github\/scripts\/classify-pr-paths\.sh\); then/u);
+});
+
+test('integration-test is gated on the integration output, which the changes job exposes', () => {
+  assert.match(job('changes'), /^      integration: \$\{\{ steps\.classify\.outputs\.integration \}\}$/mu);
+  assert.match(
+    job('integration-test'),
+    new RegExp(`^    if: needs\\.changes\\.outputs\\.code == 'true' && needs\\.changes\\.outputs\\.app == 'true' && needs\\.changes\\.outputs\\.integration == 'true'${thinOpt('integration-test')}$`, 'mu'),
+  );
+  assert.match(summary, /^          INTEGRATION_CHANGED: \$\{\{ needs\.changes\.outputs\.integration \}\}$/mu);
+  assert.match(
+    summary,
+    /\{ \[\[ "\$\{INTEGRATION_CHANGED\}" == "true" \]\] && \[\[ "\$\{INTEGRATION_TEST_RESULT\}" != "success" \]\]; \} \|\| \\\n\s*\{ \[\[ "\$\{INTEGRATION_CHANGED\}" != "true" \]\] && \[\[ "\$\{INTEGRATION_CHANGED\}" != "false" \]\]; \} \|\| \\\n\s*\{ \[\[ "\$\{INTEGRATION_CHANGED\}" == "false" \]\] && \[\[ "\$\{INTEGRATION_TEST_RESULT\}" != "skipped" \]\]; \}/u,
+  );
+  assert.doesNotMatch(summary, /\[\[ "\$\{API_CHANGED\}" [!=]= "[a-z]+" \]\] && \[\[ "\$\{INTEGRATION_TEST_RESULT\}"/u, 'integration must no longer ride API_CHANGED');
+});
+
+for (const [label, env, passes] of [
+  ['integration expected and green', { INTEGRATION_CHANGED: 'true', INTEGRATION_TEST_RESULT: 'success' }, true],
+  ['integration expected and red', { INTEGRATION_CHANGED: 'true', INTEGRATION_TEST_RESULT: 'failure' }, false],
+  ['integration expected but skipped', { INTEGRATION_CHANGED: 'true', INTEGRATION_TEST_RESULT: 'skipped' }, false],
+  ['integration expected but cancelled', { INTEGRATION_CHANGED: 'true', INTEGRATION_TEST_RESULT: 'cancelled' }, false],
+  ['integration not expected and skipped', { INTEGRATION_CHANGED: 'false', INTEGRATION_TEST_RESULT: 'skipped' }, true],
+  ['integration not expected but ran', { INTEGRATION_CHANGED: 'false', INTEGRATION_TEST_RESULT: 'success' }, false],
+  ['integration not expected, cancelled', { INTEGRATION_CHANGED: 'false', INTEGRATION_TEST_RESULT: 'cancelled' }, false],
+  ['integration output empty, skipped', { INTEGRATION_CHANGED: '', INTEGRATION_TEST_RESULT: 'skipped' }, false],
+  ['integration output empty, green', { INTEGRATION_CHANGED: '', INTEGRATION_TEST_RESULT: 'success' }, false],
+  ['integration output not a boolean', { INTEGRATION_CHANGED: 'maybe', INTEGRATION_TEST_RESULT: 'skipped' }, false],
+  // Web-only PR: api=true (test-api reads apps/web) but integration=false.
+  ['api changed, integration not expected and skipped', { API_CHANGED: 'true', INTEGRATION_CHANGED: 'false', INTEGRATION_TEST_RESULT: 'skipped' }, true],
+]) {
+  for (const IS_PR of ['true', 'false']) {
+    test(`CI Success (integration, IS_PR=${IS_PR}): ${label}`, () => {
+      const execution = spawnSync('bash', ['-e', '-c', summaryScript], {
+        encoding: 'utf8',
+        env: { ...process.env, ...appPassing, CODE_CHANGED: 'true', DOCS_CHANGED: 'true', IS_PR, ...env },
+      });
+      assert.equal(execution.status, passes ? 0 : 1, execution.stdout + execution.stderr);
+    });
+  }
+}
+
+// ── W05 (#10749): the nightly full run on main ───────────────────────────
+// The thin merge queue's backstop. A scheduled run has no diff, so the classifier
+// takes the full-suite path (`workflow_dispatch and any other event` above), and it
+// never reads a queue selection, so nothing in it is thinned. `main-red-alert`
+// turns a red nightly into the `ci-red` issue. GitHub can delay or drop a
+// scheduled run: the freshness check (a completed scheduled run on main within
+// 30 h) is the first-week daily check, then the W06 shepherd's.
+test('the nightly schedule: one cron, its own concurrency group, never a thin run', () => {
+  const trigger = workflow.slice(0, workflow.indexOf('\njobs:\n'));
+  assert.match(trigger, /^  schedule:\n    - cron: '17 6 \* \* \*'$/mu);
+  assert.equal((trigger.match(/- cron:/gu) ?? []).length, 1, 'one nightly, no other schedule');
+  // A manual dispatch on main and the nightly must never cancel each other.
+  assert.match(trigger, /^concurrency:\n  group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\$\{\{ github\.event_name == 'schedule' && '-nightly' \|\| '' \}\}\n  cancel-in-progress: true$/mu);
+  // The only producer of `thin_skip` is the queue consumer, and it runs on
+  // merge_group alone (the output line is pinned in queue-selection.test.mjs).
+  assert.match(job('changes'), /^        id: queue_thin\n        if: github\.event_name == 'merge_group'$/mu);
+  assert.match(job('main-red-alert'),
+    /^    if: always\(\) && \(github\.event_name == 'workflow_dispatch' \|\| github\.event_name == 'schedule'\) && github\.ref == 'refs\/heads\/main'$/mu);
+  // The CI map documents the nightly and how to check that it ran.
+  const doc = readFileSync(new URL('../../docs/agents/testing.md', import.meta.url), 'utf8');
+  for (const text of ['`17 6 * * *`', 'gh run list --workflow CI --branch main --event schedule', '`main-red-alert`']) {
+    assert.ok(doc.includes(text), `testing.md must mention ${text}`);
+  }
+});
+
+// Derived, so a future dispatch-only branch fails here instead of silently
+// skipping on the nightly. Every non-comment line that names `workflow_dispatch`
+// in any form (an expression, either quote style, `==` or `!=`, or a shell test
+// on EVENT_NAME / GITHUB_EVENT_NAME) must also name `schedule`, except the
+// trigger key and the two lines named below. A multi-line condition that puts
+// `schedule` on another line is flagged too: write it on one line.
+const MOBILE_OUTPUT_LINE = "mobile: ${{ github.event_name == 'workflow_dispatch' || steps.changes.outputs.mobile == 'true' || steps.lockfile.outputs.changed == 'true' }}";
+const DISPATCH_EXEMPT = new Map([
+  // The gate replay reads queue history; it says nothing about main's health.
+  ["if: github.event_name == 'workflow_dispatch'", 'ci-gate-replay'],
+  // Pinned byte-for-byte by the CI Gate (ci-gate.mjs MOBILE_OUTPUT); the
+  // schedule forces native through the job's steps (mobile-native-ci.test.mjs).
+  [MOBILE_OUTPUT_LINE, 'mobile-native-changes'],
+]);
+const jobIn = (text, name) => text.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'))?.[1] ?? '';
+function dispatchOnlyBranches(text) {
+  const lines = text.split('\n').map((line) => line.trim())
+    .filter((line) => !line.startsWith('#') && line !== 'workflow_dispatch:' && /workflow_dispatch/u.test(line));
+  return lines.filter((line) => {
+    const owner = DISPATCH_EXEMPT.get(line);
+    if (owner) return lines.filter((l) => l === line).length !== 1 || !jobIn(text, owner).split('\n').some((l) => l.trim() === line);
+    return !/\bschedule\b/u.test(line);
+  });
+}
+
+test('every workflow_dispatch branch in ci.yml also covers the nightly schedule', () => {
+  assert.deepEqual(dispatchOnlyBranches(workflow), []);
+  // The scan sees each exemption and the main-red-alert branch, so it is not passing on nothing.
+  const seen = workflow.split('\n').filter((line) => !line.trim().startsWith('#') && line.includes('workflow_dispatch')).length;
+  assert.ok(seen >= 4, `scan is stale (${seen} lines)`);
+});
+
+test('the dispatch scan flags every dispatch-only form it promises to', () => {
+  const inject = (line) => workflow.replace('\njobs:\n', `\njobs:\n  injected:\n    runs-on: ubuntu-latest\n    ${line}\n`);
+  for (const line of [
+    "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'",
+    'if: github.event_name == "workflow_dispatch"',
+    "if: github.event_name != 'workflow_dispatch'",
+    "if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}",
+    'run: \'[[ "${EVENT_NAME}" == "workflow_dispatch" ]] && echo full\'',
+    "if: (github.event_name == 'workflow_dispatch' ||",
+  ]) {
+    assert.deepEqual(dispatchOnlyBranches(inject(line)), [line], line);
+  }
+  // A covered branch passes; an exempt line outside its owner job does not.
+  assert.deepEqual(dispatchOnlyBranches(inject("if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'")), []);
+  // A second copy of an exempt line (here, in another job) flags both copies.
+  assert.deepEqual(dispatchOnlyBranches(inject("if: github.event_name == 'workflow_dispatch'")),
+    ["if: github.event_name == 'workflow_dispatch'", "if: github.event_name == 'workflow_dispatch'"]);
+});

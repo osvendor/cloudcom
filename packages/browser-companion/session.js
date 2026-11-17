@@ -58,6 +58,8 @@ export function browserRequest(input){
   if(input.action==='notesList')return apiRequest({orgId:input.orgId,path:vaultBase+'/documents?q='+encodeURIComponent(input.query)});
   if(input.action==='notesRead')return apiRequest({orgId:input.orgId,path:vaultBase+'/documents/'+input.documentId});
   if(input.action==='vaultList')return apiRequest({orgId:input.orgId,path:vaultBase+'/credentials?q='+encodeURIComponent(input.query)});
+  if(input.action==='credentialCreate')return apiRequest({orgId:input.orgId,path:vaultBase+'/credentials',method:'POST',body:{requestId:input.requestId,category:input.category,isAdministration:input.isAdministration}});
+  if(input.action==='credentialUpdate')return apiRequest({orgId:input.orgId,path:vaultBase+'/credentials/'+input.credentialId,method:'PATCH',body:{version:input.version,fields:input.fields}});
   if(input.action==='copySecret')return apiRequest({orgId:input.orgId,path:vaultBase+'/credentials/'+input.credentialId+'/'+(input.field==='otp'?'otp':'reveal'),method:'POST',body:input.field==='otp'?{}:{field:'password'}});
   if(input.action==='clients')return apiRequest({path:'/credentials/browser/clients'});
   if(input.action==='devices')return apiRequest({orgId:input.orgId,path:base+'/devices?q='+encodeURIComponent(input.query)});

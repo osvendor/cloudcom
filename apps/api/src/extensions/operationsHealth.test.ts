@@ -51,6 +51,8 @@ describe('operations health collector', () => {
   it('rechecks active platform status even when results are cached', async () => {
     const { readOperationsHealth } = await import('./operationsHealth');
     const first = await readOperationsHealth(admin);
+    expect(first?.cards.find(card => card.id === 'workers')?.title).toBe('API background workers');
+    expect(first?.cards.find(card => card.id === 'exchange-worker')?.title).toBe('Exchange worker');
     expect(first?.alertWorkload?.windowMs).toBe(300_000);
     expect(first?.alertWorkload?.groups).toHaveLength(9);
     expect(first?.alertWorkload?.scriptMonitors).toEqual([]);

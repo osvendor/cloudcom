@@ -203,6 +203,19 @@ describe('two-step remote login', () => {
     expect(portalSessions.size).toBe(0);
     expect(gateway).not.toHaveBeenCalled();
   });
+  it('checks mixed-case staff identities before allowing native customer login', async () => {
+    staffLookup.mockResolvedValue([{ id: 'mixed-case-staff-account' }]);
+    expect((await login(true)).status).toBe(401);
+    const predicates = whereSpy.mock.calls.map(([predicate]) =>
+      new PgDialect().sqlToQuery(predicate as never));
+    const staffPredicate = predicates.find(query => query.params.includes('staff-email'));
+    expect(staffPredicate).toBeDefined();
+    const emailParameter = staffPredicate!.params.indexOf('staff-email');
+    expect(staffPredicate!.sql).toContain(`lower($${emailParameter + 1}) = $${emailParameter + 2}`);
+    expect(staffPredicate!.params[emailParameter + 1]).toBe('cust@acme.example');
+    expect(portalSessions.size).toBe(0);
+    expect(gateway).not.toHaveBeenCalled();
+  });
   it('does not query staff identity before proving the customer password', async () => {
     passwordCheck.mockResolvedValue(false);
     expect((await login(true)).status).toBe(401);
@@ -255,7 +268,7 @@ function policyFor(orgId: string, mode: 'allowed' | 'sso_only') {
   const proven = mode === 'sso_only';
   return {
     orgId, partnerId: 'partner-1', entraTenant: proven ? { tenantId: PROVEN_TENANT_ID, provenAt: '2026-11-01T00:00:00.000Z' } : null,
-    ...pickEffectivePortalAccessPolicy(org, null, { entra: true, google: false, selfRegistration: false }, { entraTenantProven: proven }),
+    ...pickEffectivePortalAccessPolicy(org, null, { entra: true, google: false, selfRegistration: false }, { entraTenantProven: proven, googleDomainVerified: false }),
   };
 }
 const PROVEN_TENANT_ID = '72f988bf-86f1-41af-91ab-2d7cd011db47';
@@ -537,6 +550,41 @@ describe('POST /auth/login — uniform failure for an email with several account
     const open = new PgDialect().sqlToQuery(whereSpy.mock.calls[0]![0] as never).params;
     expect(open).not.toContain(ORG_ID);
     expect(open).toEqual(expect.arrayContaining(['browserAccess', 'granted']));
+  });
+
+  // #11541: a login stored with mixed case must be loginable.
+  it('matches the stored address case-insensitively (#11541)', async () => {
+    portalUserRows.current = [acct('11111111-0000-4000-8000-000000000001', ORG_ID, 'Mixed.Case@X.Test', 'PassA1!')];
+    const res = await login({ email: 'mixed.case@x.test', password: 'PassA1!', orgId: ORG_ID });
+    expect(res.status).toBe(200);
+    const q = new PgDialect().sqlToQuery(whereSpy.mock.calls[0]![0] as never);
+    const i = q.params.indexOf('email');
+    expect(q.sql).toContain(`lower($${i + 1}) = $${i + 2}`);
+    expect(q.params[i + 1]).toBe('mixed.case@x.test');
+  });
+
+  // Two logins in ONE org whose addresses differ only by case are separate
+  // accounts with separate passwords. The credential picks the account: no
+  // password opens the other row, and a password both share is the generic 401.
+  it('case-only duplicates in one org: the password picks the account, a shared password fails closed (#11541)', async () => {
+    portalUserRows.current = [
+      acct('11111111-0000-4000-8000-000000000001', ORG_ID, 'Ada@X.Test', 'PassA1!'),
+      acct('11111111-0000-4000-8000-000000000002', ORG_ID, 'ada@x.test', 'PassB1!'),
+    ];
+    const res = await login({ email: 'ADA@x.test', password: 'PassA1!', orgId: ORG_ID });
+    expect(res.status).toBe(200);
+    expect([...portalSessions.values()][0]).toMatchObject({ portalUserId: '11111111-0000-4000-8000-000000000001' });
+
+    portalSessions.clear();
+    portalRateLimitBuckets.clear();
+    portalUserRows.current = [
+      acct('11111111-0000-4000-8000-000000000001', ORG_ID, 'Ada@X.Test', 'Same1!'),
+      acct('11111111-0000-4000-8000-000000000002', ORG_ID, 'ada@x.test', 'Same1!'),
+    ];
+    const both = await login({ email: 'ada@x.test', password: 'Same1!', orgId: ORG_ID });
+    expect(both.status).toBe(401);
+    expect(await both.json()).toEqual({ error: 'Invalid email or password' });
+    expect(portalSessions.size).toBe(0);
   });
 
   it('an account with no password (invite pending) still costs one dummy verify and gets the generic 401', async () => {

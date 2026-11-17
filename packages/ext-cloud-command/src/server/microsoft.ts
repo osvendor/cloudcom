@@ -22,7 +22,7 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'invalid_or_failed_request';
-      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'last_group_owner', 'method_not_removable', 'usage_location_required', 'license_not_available', 'license_assignment_state_unknown', 'license_inherited']);
+      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'credential_capture_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'last_group_owner', 'method_not_removable', 'usage_location_required', 'license_not_available', 'license_assignment_state_unknown', 'license_inherited']);
       const operation = method === 'execute' ? await c.req.json().catch(() => null) as { type?: unknown } | null : null;
       const optionalRole = operation?.type === 'user.password.reset' ? 'User-PasswordProfile.ReadWrite.All'
         : operation?.type === 'user.license.assign' || operation?.type === 'user.license.remove' ? 'LicenseAssignment.ReadWrite.All or User.ReadWrite.All'
@@ -31,7 +31,9 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
             : operation?.type === 'user.globalAdmin.set' ? 'RoleManagement.ReadWrite.Directory'
             : operation?.type === 'user.mfa.methods.list' ? 'UserAuthenticationMethod.Read.All'
               : operation?.type === 'user.mfa.method.remove' || operation?.type === 'user.mfa.recoveryEmail.set' || operation?.type === 'user.mfa.mobilePhone.set' ? 'UserAuthenticationMethod.ReadWrite.All' : null;
-      const message = code === 'unknown_write_outcome'
+      const message = code === 'credential_capture_unavailable'
+        ? 'Credential storage is unavailable or this account already has a pending creation. Review Credentials before creating the user again.'
+        : code === 'unknown_write_outcome'
         ? 'The change may have been applied. Refresh before attempting another change.'
         : code === 'provider_rejected' && operation?.type === 'user.update'
           ? 'Microsoft rejected the profile update. Refresh the user and review the current values before trying again.'

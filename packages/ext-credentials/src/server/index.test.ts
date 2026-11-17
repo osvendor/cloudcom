@@ -21,7 +21,7 @@ function harness(options: {
   const queued = [...(options.results ?? [[{ partner_id: PARTNER }]])];
   const execute = vi.fn(async (_query: unknown) => queued.shift() ?? []);
   const decryptForColumn = vi.fn(() => JSON.stringify({ version: 1, orgId: options.decryptedOrg ?? ORG, id: ID, password: syntheticPassword, otpSecret: 'JBSWY3DPEHPK3PXP', notes: 'SYNTHETIC-private-notes' }));
-  const encryptForColumn = vi.fn(() => 'enc:v3:test-key:ciphertext');
+  const encryptForColumn = vi.fn((_table: string, _column: string, _plaintext: string) => 'enc:v3:test-key:ciphertext');
   const audit = vi.fn(async () => { if (options.auditFails) throw new Error('SYNTHETIC-audit-failure'); });
   const log = vi.fn();
   const context = { db: { execute }, secrets: { decryptForColumn, encryptForColumn }, audit, log };
@@ -45,6 +45,77 @@ function harness(options: {
 
 const headers = ['id', 'organization', 'name', 'password_category', 'resource_type', 'resource_id', 'username', 'password', 'one_time_password', 'archived', 'url', 'notes', 'otp_secret', 'shareable'];
 const fixtureCsv = (records: Array<Record<string, string>>) => [headers.join(','), ...records.map(record => headers.map(key => `"${(({ id: '1', organization: 'Client A', name: 'Synthetic record', username: 'test@example.invalid', password: syntheticPassword, ...record } as Record<string, string>)[key] ?? '').replaceAll('"', '""')}"`).join(','))].join('\r\n');
+
+describe('credential draft writes', () => {
+  it.each([['https://admin.microsoft.com',''],['https://accounts.google.com',''],['https://custom.example.test','https://custom.example.test']])('clears only generated email URLs on draft category changes %s',async(url,expected)=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[{id:ID,version:1,name:'Microsoft 365',category:'Email',username:'person',url,isDraft:true,isAdministration:true,secret_ciphertext:'enc:v3:synthetic'}],[{id:ID,version:2}]]});
+    const response=await h.app.request(`http://local/orgs/${ORG}/credentials/${ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version:1,fields:{category:'Local / Domain'}})});
+    expect(response.status).toBe(200);expect(h.queries()[2]!.params[4]).toBe(expected);
+    const sealed=JSON.parse(h.encryptForColumn.mock.calls[0]![2] as string);
+    expect(sealed.password).toBe(syntheticPassword);expect(sealed.otpSecret).toBe('JBSWY3DPEHPK3PXP');
+  });
+  it('restores provider defaults when a generic draft enters Email',async()=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[{id:ID,version:1,name:'Local / Domain',category:'Local / Domain',username:'person',url:'',isDraft:true,isAdministration:false,secret_ciphertext:'enc:v3:synthetic'}],[{name:'Google Workspace',username:'existing@company.test',email:''}],[{id:ID,version:2}]]});
+    const response=await h.app.request(`http://local/orgs/${ORG}/credentials/${ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version:1,fields:{category:'Email'}})});
+    expect(response.status).toBe(200);expect(h.queries()[3]!.params[0]).toBe('Google Workspace');expect(h.queries()[3]!.params[4]).toBe('https://accounts.google.com');
+  });
+  it.each([
+    [[{name:'Google Workspace',username:'alice@company.test',email:'ALICE@company.test'}],{provider:'google',domain:'company.test'}],
+    [[{name:'Microsoft 365',username:'alice@one.test',email:'alice@two.test'}],{provider:'microsoft',domain:null}],
+    [[{name:'Google Workspace',username:'alice@gmail.com',email:''}],{provider:'google',domain:null}],
+    [[{name:'Microsoft 365',username:'alice@company.test'},{name:'Google Workspace',username:'bob@company.test'}],{provider:null,domain:null}],
+  ])('returns conservative client email defaults %j',async(records,expected)=>{
+    const h=harness({results:[[{partner_id:PARTNER}],records,[{id:ID,version:1,isDraft:true}]]});
+    const response=await h.request('credentials',{requestId:ID,category:'Email',isAdministration:false});
+    expect((await response.json()).emailDefaults).toEqual(expected);
+    const query=h.queries()[1]!;
+    expect(query.params).toEqual([ORG]);
+    expect(query.sql).toContain("archived=false AND is_draft=false AND category='Email'");
+    expect(query.sql).not.toContain('secret_ciphertext');
+  });
+  it('returns unfiltered same-org defaults when searching the vault',async()=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[],[{name:'Google Workspace',username:'alice@company.test',email:''}]]});
+    const response=await h.request('credentials?q=unmatched');
+    expect((await response.json()).emailDefaults).toEqual({provider:'google',domain:'company.test'});
+    expect(h.queries()[2]!.params).toEqual([ORG]);
+  });
+  it.each([['Microsoft 365',true,'Network / Wi-Fi'],['Special service',true,'Special service'],['Google Workspace',false,'Google Workspace']])('updates default draft labels without overwriting specific names %s',async(name,isDraft,expected)=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[{id:ID,version:1,name,category:'Email',username:'person',url:'',isDraft,isAdministration:false,secret_ciphertext:'enc:v3:synthetic'}],[{id:ID,version:2}]]});
+    const response=await h.app.request(`http://local/orgs/${ORG}/credentials/${ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version:1,fields:{category:'Network / Wi-Fi'}})});
+    expect(response.status).toBe(200);expect(h.queries()[2]!.params[0]).toBe(expected);
+  });
+  it.each([{denied:['import']},{denied:['reveal']},{mfa:false},{access:false},{sites:[]}])('denies unauthorized generation %j',async options=>{
+    const h=harness(options);const r=await h.request('credentials',{requestId:ID,category:'Email',isAdministration:false});
+    expect(r.status).toBe(403);expect(h.encryptForColumn).not.toHaveBeenCalled();
+  });
+  it('persists a generated password encrypted before returning the draft',async()=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[],[{id:ID,version:1,isDraft:true}]]});
+    const r=await h.request('credentials',{requestId:ID,category:'Email',isAdministration:false});
+    expect(r.status).toBe(200);const result=await r.json();expect(result.value).toMatch(/^[A-Z][a-z]{2,3}[!@#$%*?][a-z]{3,4}\d{2}$/);
+    expect(h.queries()[2]!.sql).toContain('ON CONFLICT');expect(h.queries()[2]!.params).not.toContain(result.value);
+    expect(JSON.stringify(h.audit.mock.calls)).not.toContain(result.value);
+  });
+  it.each([[['Google Workspace'],'Google Workspace'],[['Microsoft 365','Google Workspace'],'Email']])('uses only an unambiguous client mail provider %j',async(names,expected)=>{
+    const h=harness({results:[[{partner_id:PARTNER}],(names as string[]).map(name=>({name})),[{id:ID,version:1,isDraft:true}]]});
+    expect((await h.request('credentials',{requestId:ID,category:'Email',isAdministration:true})).status).toBe(200);
+    expect(h.queries()[2]!.params[2]).toBe(expected);
+    expect(h.queries()[1]!.params).toContain(ORG);
+  });
+  it('rejects categories outside the concise list',async()=>{
+    const h=harness();expect((await h.request('credentials',{requestId:ID,category:'Vendor',isAdministration:false})).status).toBe(400);
+  });
+  it('does not mutate or generate on stale edits',async()=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[{id:ID,version:4}]]});
+    const r=await h.app.request(`http://local/orgs/${ORG}/credentials/${ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version:3,fields:{generatePassword:true}})});
+    expect(r.status).toBe(409);expect(h.encryptForColumn).not.toHaveBeenCalled();expect(h.execute).toHaveBeenCalledTimes(2);
+  });
+  it.each([['Network / Wi-Fi',200],['Email',422]])('completion handles password-only %s accounts',async(category,status)=>{
+    const h=harness({results:[[{partner_id:PARTNER}],[{id:ID,version:1,name:'Guest network',category,username:'',url:'',isDraft:true,isAdministration:false,secret_ciphertext:'enc:v3:synthetic'}],[{id:ID,version:2,isDraft:false}]]});
+    const r=await h.app.request(`http://local/orgs/${ORG}/credentials/${ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version:1,fields:{isDraft:false}})});
+    expect(r.status).toBe(status);
+    if(status===422)expect(h.encryptForColumn).not.toHaveBeenCalled();
+  });
+});
 
 describe('live remote session credential boundaries', () => {
   const sessionResult = [{ org_id: ORG, device_id: DEVICE }];
@@ -193,6 +264,26 @@ describe('credential API boundaries', () => {
     expect(response.status).toBe(400);
     expect(h.execute).toHaveBeenCalledTimes(1);
     expect(h.encryptForColumn).not.toHaveBeenCalled();
+  });
+  it('rejects the entire standalone-secret batch before writing or encrypting', async () => {
+    const h = harness();
+    const response = await h.request('import/commit', { sourceOrganization: 'Client A', csv: fixtureCsv([{ name: 'Microsoft 365' }, { id: '2', name: 'Widget API key' }]) });
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ code: 'NOTES_REQUIRED', count: 1, error: expect.stringContaining('client Notes') });
+    expect(h.execute).toHaveBeenCalledTimes(1);
+    expect(h.encryptForColumn).not.toHaveBeenCalled();
+    expect(h.audit).not.toHaveBeenCalled();
+  });
+  it('inserts normalized metadata and saves ambiguity as a draft', async () => {
+    const h = harness();
+    const response = await h.request('import/commit', { sourceOrganization: 'Client A', csv: fixtureCsv([{ name: '<b>Microsoft 365 tenant admin</b>' }, { id: '2', name: 'Unrecognized widget' }]) });
+    expect(response.status).toBe(200);
+    const insert = h.queries().find(query => query.sql.includes('INSERT INTO credentials_records'))!;
+    expect(insert.sql).toContain('is_administration,is_draft');
+    expect(insert.params.slice(2, 4)).toEqual(['Microsoft 365', 'Email']);
+    expect(insert.params.slice(13, 15)).toEqual([true, false]);
+    expect(insert.params.slice(28, 30)).toEqual([false, true]);
+    expect(insert.params).not.toContain(syntheticPassword);
   });
   it.each<Record<string, string>>([{ otp_secret: 'invalid!' }, { one_time_password: '123456' }])('blocks committing invalid or missing OTP seed %j', async value => {
     const h = harness();

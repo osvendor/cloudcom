@@ -23,4 +23,4 @@ done
 pnpm --filter @breeze/api exec vitest run --config vitest.config.cloudcom-reviewed-db.ts
 pnpm --filter @breeze/api exec vitest run --config vitest.config.rls-coverage.ts --maxWorkers=1
 pnpm --filter @breeze/api exec vitest run --config vitest.config.rls.ts --maxWorkers=1
-pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/tenant-export-policy.integration.test.ts src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts --maxWorkers=1
+pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/tenant-export-policy.integration.test.ts src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts src/__tests__/integration/cloudCommandCredentialCapture.integration.test.ts --maxWorkers=1

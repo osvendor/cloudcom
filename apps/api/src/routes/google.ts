@@ -17,7 +17,7 @@ import { eq, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { googleWorkspaceConnections } from '../db/schema/google';
-import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
+import { authMiddleware, withAuthDbAccessContext, requireMfa, requirePermission } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
 import { captureException } from '../services/sentry';
 import { encryptSecret } from '../services/secretCrypto';
@@ -101,7 +101,7 @@ googleRoutes.post(
     const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
     if (!orgId) return c.json({ error: 'orgId is required for this scope' }, 400);
     // canAccessOrg is true for system scope: the holding org is never a target.
-    if (await isHoldingOrg(orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
+    if (await withAuthDbAccessContext(auth, () => isHoldingOrg(orgId))) return c.json(PROTECTED_ORG_ERROR, 409);
 
     const payload = c.req.valid('json');
 
@@ -138,7 +138,7 @@ googleRoutes.post(
     // Both credential modes lock the same organization row before checking the
     // other table and writing. This serializes a DWD POST racing an OAuth
     // callback, including when neither connection existed at request start.
-    const saved = await db.transaction(async tx => {
+    const saved = await withAuthDbAccessContext(auth, () => db.transaction(async tx => {
       await tx.execute(sql`SELECT id FROM organizations WHERE id = ${orgId}::uuid FOR UPDATE`);
       const oauth = await tx.execute(sql`SELECT id FROM cloudcommand_google_oauth_connections
         WHERE org_id = ${orgId}::uuid LIMIT 1`);
@@ -175,7 +175,7 @@ googleRoutes.post(
         },
       }).returning();
       return { conflict: false as const, row: row ?? null };
-    });
+    }));
 
     if (saved.conflict) return c.json({ error: 'Disconnect the OAuth connection before switching credential modes' }, 409);
     const row = saved.row;

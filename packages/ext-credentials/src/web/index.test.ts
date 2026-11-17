@@ -36,4 +36,22 @@ describe("cloudcom-credentials-page", () => {
     const request = vi.fn((path: string, init?: RequestInit) => init?.method === "POST" ? new Promise<Response>((resolve) => { resolveReveal = resolve; }) : Promise.resolve(response({ credentials: [{ id: "x", name: "Entry", hasPassword: true, hasOtp: false }] })));
     const el = new CredentialsPage(); el.hostApi = { request }; el.context = { organizationId: "one" }; document.body.append(el); await tick(); el.shadowRoot!.querySelector<HTMLButtonElement>("button[aria-label='Reveal password']")!.click(); el.context = { organizationId: "two" }; resolveReveal(response({ value: "stale-secret" })); await tick(); expect(el.shadowRoot?.textContent).not.toContain("stale-secret");
   });
+
+  it("separates administration credentials and displays category, draft and temporary status", async () => {
+    const el = new CredentialsPage(); el.hostApi = { request: async () => response({ credentials: [
+      { id: "user", name: "Email", category: "Email", username: "person@example.test", hasPassword: true, hasOtp: false, temporaryPassword: true },
+      { id: "admin", name: "Google Workspace", category: "Email", username: "admin@example.test", hasPassword: true, hasOtp: false, isAdministration: true, isDraft: true },
+    ] }) }; el.context = { organizationId: "org" }; document.body.append(el); await tick();
+    expect(el.shadowRoot?.textContent).toContain("person@example.test"); expect(el.shadowRoot?.textContent).toContain("Temporary password"); expect(el.shadowRoot?.textContent).not.toContain("admin@example.test");
+    el.shadowRoot!.querySelectorAll<HTMLButtonElement>(".sections button")[1].click();
+    expect(el.shadowRoot?.textContent).toContain("admin@example.test"); expect(el.shadowRoot?.textContent).toContain("Account / tenant administration: Yes · Draft"); expect(el.shadowRoot?.textContent).not.toContain("person@example.test");
+  });
+
+  it("section changes invalidate outstanding secret reveals", async () => {
+    let finish!: (value: Response) => void;
+    const el = new CredentialsPage(); el.hostApi = { request: async (_path, init) => init?.method === "POST" ? new Promise<Response>(resolve => { finish = resolve; }) : response({ credentials: [{ id: "c", name: "Email", category: "Email", hasPassword: true, hasOtp: false }] }) };
+    el.context = { organizationId: "org" }; document.body.append(el); await tick(); el.shadowRoot!.querySelector<HTMLButtonElement>("button[aria-label='Reveal password']")!.click();
+    el.shadowRoot!.querySelectorAll<HTMLButtonElement>(".sections button")[1].click(); finish(response({ value: "must-not-return" })); await tick();
+    el.shadowRoot!.querySelectorAll<HTMLButtonElement>(".sections button")[0].click(); expect(el.shadowRoot?.textContent).not.toContain("must-not-return");
+  });
 });

@@ -258,7 +258,18 @@ export async function initializeAiTranscriptSweeper(): Promise<void> {
 
 export async function shutdownAiTranscriptSweeper(): Promise<void> {
   if (worker) { await worker.close(); worker = null; }
-  if (queue) { await queue.close(); queue = null; }
+  if (queue) {
+    const ownedQueue = queue; queue = null;
+    try {
+      // A recreated container has a new hostname/queue. Remove only this
+      // instance's nightly schedule after draining its worker; otherwise the
+      // old queue retains delayed jobs no future instance can process.
+      // Crash-orphan reclamation needs separate liveness proof and is not done here.
+      for (const job of await ownedQueue.getRepeatableJobs()) {
+        if (job.name === JOB_NAME) await ownedQueue.removeRepeatableByKey(job.key);
+      }
+    } finally { await ownedQueue.close(); }
+  }
 }
 
 export const __testOnly = { QUEUE_NAME, queueNameForHost };

@@ -31,7 +31,7 @@ describe('Microsoft directory snapshot read route', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(await response.json()).toMatchObject({ tenantId: TENANT,
-      directory: { status: 'ready', data: { users: [{ id: 'member' }] } },
+      directory: { status: 'stale', data: { users: [{ id: 'member' }] } },
       usage: { status: 'stale', collectedAt: '2026-09-25T09:00:00.000Z' } });
     const query = JSON.stringify(h.execute.mock.calls[0]);
     expect(query).toContain(ORG); expect(query).toContain(TENANT);

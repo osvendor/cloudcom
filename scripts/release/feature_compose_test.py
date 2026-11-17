@@ -49,11 +49,12 @@ class FeatureComposeTest(unittest.TestCase):
             image = "cloudcom-candidate/api@sha256:" + "a" * 64
             worker_image = "cloudcom-candidate/exchange-worker@sha256:" + "b" * 64
             baseline = {"services": {"api": {"image": image}, "cloudcom-exchange-worker": {
-                "image": worker_image, "cpus": 0.25, "cpu_shares": 128, "stop_grace_period": "60s",
+                "image": worker_image, "cpus": 1.0, "cpu_shares": 128, "stop_grace_period": "60s",
+                "sysctls": {"net.ipv4.tcp_syn_retries": "2"},
                 "volumes": [{"type": "bind", "source": "/private", "target": "/run/private"}]}}}
             result = prepare(copy.deepcopy(baseline), release, image, worker_image, allowed)
             mounts = result["services"]["cloudcom-exchange-worker"]["volumes"]
-            for resource in ('cpus', 'cpu_shares', 'stop_grace_period'):
+            for resource in ('cpus', 'cpu_shares', 'stop_grace_period', 'sysctls'):
                 self.assertEqual(result['services']['cloudcom-exchange-worker'][resource],
                                  baseline['services']['cloudcom-exchange-worker'][resource])
             self.assertEqual(mounts[0], baseline["services"]["cloudcom-exchange-worker"]["volumes"][0])

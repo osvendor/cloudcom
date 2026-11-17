@@ -2,13 +2,17 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { MicrosoftRequest } from './native-microsoft';
 import { createAdministrationServices } from './admin-services';
+import type { ExchangeReadCachePort } from './exchange-read-cache';
 
 const { store } = vi.hoisted(() => ({ store: { load: vi.fn(), start: vi.fn(), claim: vi.fn(), advance: vi.fn(), finish: vi.fn(), save: vi.fn(), disable: vi.fn() } }));
 vi.mock('./admin-store', () => ({ createAdministrationStore: () => store }));
+const { invalidateSnapshot } = vi.hoisted(() => ({ invalidateSnapshot: vi.fn(async () => {}) }));
+vi.mock('./directory-snapshot-store', () => ({ invalidateDirectorySnapshot: invalidateSnapshot }));
 const org = '11111111-1111-4111-8111-111111111111', actor = '22222222-2222-4222-8222-222222222222';
 const tenant = '33333333-3333-4333-8333-333333333333', client = '44444444-4444-4444-8444-444444444444';
 const request = { orgId: org, auth: {}, authorization: {} } as MicrosoftRequest;
 function setup() {
+  invalidateSnapshot.mockReset();
   for (const fn of Object.values(store)) fn.mockReset();
   store.load.mockResolvedValue(null); store.advance.mockResolvedValue(true); store.save.mockResolvedValue(true);
   const runtime = {
@@ -27,6 +31,50 @@ function setup() {
 function attempt() { return { org_id: org, actor_id: actor, tenant_id: tenant, client_id: client, credential_version: 'cert-1',
   expected_generation: null, nonce: 'nonce', verifier_ciphertext: 'enc:v3:opaque', state_hash: 'hashed', stage: 'processing' }; }
 describe('unified administration onboarding', () => {
+  it('rechecks authorization and connection before returning a cached mailbox result', async () => {
+    const h=setup();
+    const binding={id:client,orgId:org,tenantId:tenant,clientId:client,enabled:true,generation:1,credentialVersion:'cert-1',permissionManifestVersion:'p1'};
+    store.load.mockResolvedValue(binding);
+    const get=vi.fn(async(key:string)=>key.endsWith(':data')?{checkedAt:Date.now(),value:{smtpAddress:'private@example.test'}}:null);
+    const cache:ExchangeReadCachePort={get,set:vi.fn(),delete:vi.fn(),claim:vi.fn(),release:vi.fn(),epoch:async()=> 'epoch',runDetached:vi.fn(),withRequestDb:async(_request,work)=>work()};
+    const admin=createAdministrationServices(h.context,h.fetch,{...h.runtime,targetedReadCache:cache}).administration!;
+    await expect(admin.execute(request,{type:'mailbox.forwarding.get',mailboxId:actor})).resolves.toMatchObject({smtpAddress:'private@example.test'});
+    h.runtime.authorize.mockResolvedValueOnce(null);get.mockClear();
+    await expect(admin.execute(request,{type:'mailbox.forwarding.get',mailboxId:actor})).rejects.toMatchObject({code:'access_denied'});
+    expect(get).not.toHaveBeenCalled();
+    store.load.mockResolvedValueOnce(binding).mockResolvedValueOnce({...binding,generation:2});
+    await expect(admin.execute(request,{type:'mailbox.forwarding.get',mailboxId:actor})).rejects.toMatchObject({code:'connection_changed'});
+    expect(h.runtime.exchange).not.toHaveBeenCalled();
+    expect(invalidateSnapshot).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('preserves accepted creation with isolated snapshot invalidation failure=%s', async failInvalidation => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      enabled: true, generation: 1, credentialVersion: 'cert-1', permissionManifestVersion: 'standard-1' });
+    if (failInvalidation) invalidateSnapshot.mockRejectedValueOnce(new Error('private database failure'));
+    const credentialCapture = {
+      generatePassword: vi.fn(() => 'Maple!Fox27'),
+      prepare: vi.fn(async () => {}), complete: vi.fn(async () => {}),
+    };
+    h.fetch.mockImplementation(async (url?: string) => url?.includes('verifiedDomains')
+      ? Response.json({ value: [{ id: tenant, verifiedDomains: [{ name: 'example.test' }] }] })
+      : url?.endsWith('/users') ? Response.json({ id: actor, userPrincipalName: 'new@example.test' }, { status: 201 })
+      : Response.json({ value: [{ id: tenant }] }));
+    const withRequestDb = vi.fn(async (_request: MicrosoftRequest, work: () => Promise<unknown>) => work());
+    const targetedReadCache = { withRequestDb } as unknown as ExchangeReadCachePort;
+    const services = createAdministrationServices(h.context, h.fetch, { ...h.runtime, credentialCapture, targetedReadCache });
+    await expect(services.administration!.execute(request, { type: 'user.create', user: {
+      displayName: 'New', userPrincipalName: 'new@example.test',
+    } })).resolves.toMatchObject({ accepted: true, temporaryPassword: 'Maple!Fox27' });
+    expect(invalidateSnapshot).toHaveBeenCalledWith(h.context.db, org);
+    expect(withRequestDb).toHaveBeenCalledWith(request, expect.any(Function));
+    expect(credentialCapture.prepare).toHaveBeenCalledWith(request, expect.objectContaining({
+      connectionId: client, tenantId: tenant, username: 'new@example.test', password: 'Maple!Fox27', temporaryPassword: true,
+    }));
+    expect(credentialCapture.complete).toHaveBeenCalledWith(request, expect.objectContaining({
+      connectionId: client, tenantId: tenant, username: 'new@example.test', providerUserId: actor,
+    }));
+  });
   it.each(['user.create', 'user.license.assign', 'user.update', 'user.password.reset', 'user.sessions.revoke', 'user.globalAdmin.get', 'user.globalAdmin.set',
     'user.mfa.methods.list', 'user.mfa.method.remove', 'user.mfa.recoveryEmail.set', 'user.mfa.mobilePhone.set', 'group.member.add', 'group.owner.add'])(
     'requires manager authorization for %s before credential access', async type => {

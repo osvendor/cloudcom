@@ -38,10 +38,11 @@ import {
 } from '@breeze/shared';
 import { listPortalUsersForOrg } from '../services/portalUserDirectory';
 import { portalUserHasIdentitySql } from '../services/portalUserIdentities';
-import { isSsoOnlyStranded, resolveInviteSignInMethods } from '../services/portalSsoOnly';
+import { isSsoOnlyStranded, resolveInviteSignInMethods, type InviteSignInMethods } from '../services/portalSsoOnly';
 import { normalizeContactEmail } from '../services/contacts/crud';
 import {
   bindContactLoginForInvite,
+  dropPortalRoleForRemovedLogin,
   loadOrgContactsForPortalInvite,
   lockPortalInviteAddresses,
   ContactGoneError,
@@ -79,7 +80,7 @@ async function resolveAccessibleOrg(c: any): Promise<{ id: string } | Response> 
 }
 
 async function getOrgScopedPortalUser(orgId: string, userId: string) {
-  const [row] = await db.select({ id: portalUsers.id, orgId: portalUsers.orgId, email: portalUsers.email, name: portalUsers.name, passwordHash: portalUsers.passwordHash, authMethod: portalUsers.authMethod, status: portalUsers.status, authEpoch: portalUsers.authEpoch, browserAccess: portalUsers.browserAccess, hasExternalIdentity: portalUserHasIdentitySql() })
+  const [row] = await db.select({ id: portalUsers.id, orgId: portalUsers.orgId, email: portalUsers.email, name: portalUsers.name, passwordHash: portalUsers.passwordHash, authMethod: portalUsers.authMethod, status: portalUsers.status, authEpoch: portalUsers.authEpoch, browserAccess: portalUsers.browserAccess, contactId: portalUsers.contactId, hasExternalIdentity: portalUserHasIdentitySql() })
     .from(portalUsers).where(and(eq(portalUsers.id, userId), eq(portalUsers.orgId, orgId))).limit(1);
   return row ?? null;
 }
@@ -146,14 +147,15 @@ async function hasPortalUserReferences(userId: string): Promise<boolean> {
  * row's CURRENT auth_epoch — pass the epoch the write returned) and email it.
  *
  * The email offers what the org's effective policy allows (W4 #11381, spec
- * §5.5): "Sign in with Microsoft" (the same invite link with
- * `&method=microsoft`) when Microsoft is effective, and a password only while
- * password sign-in is allowed. A policy read that fails sends nothing (false),
+ * §5.5, W7 D12): "Sign in with Microsoft" (the same invite link with
+ * `&method=microsoft`) when Microsoft is effective, "Sign in with Google"
+ * (`&method=google`) when Google is, and a password only while password
+ * sign-in is allowed. A policy read that fails sends nothing (false),
  * like a missing token store: never an invite offering the wrong methods. The
  * read runs in its own savepoint, so catching it leaves the request usable.
  */
 export async function issueAndSendInvite(c: any, orgId: string, user: { id: string; email: string; authEpoch: number }, orgName: string | null, inviterName: string | null | undefined, message?: string): Promise<boolean> {
-  let methods: { microsoft: boolean; password: boolean };
+  let methods: InviteSignInMethods;
   try {
     methods = await resolveInviteSignInMethods(orgId);
   } catch (err) {
@@ -198,6 +200,7 @@ export async function issueAndSendInvite(c: any, orgId: string, user: { id: stri
       to: user.email,
       inviteUrl,
       microsoftUrl: methods.microsoft ? `${inviteUrl}&method=microsoft` : undefined,
+      googleUrl: methods.google ? `${inviteUrl}&method=google` : undefined,
       passwordAllowed: methods.password,
       orgName: orgName ?? undefined,
       inviterName: inviterName ?? undefined,
@@ -706,17 +709,18 @@ export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
     return c.json({ data: results });
   });
 
-  // W4 (#11381, spec §5.11): "Send Microsoft sign-in invite" to stranded
-  // accounts (no identity, so `sso_only` leaves them unable to sign in).
-  // Sequential, one result per unique id, in request order.
+  // W4 (#11381, spec §5.11): "Send SSO sign-in invite" to stranded accounts
+  // (no identity of any provider, so `sso_only` leaves them unable to sign
+  // in). Available while Microsoft or Google is effective (W7 D12); the email
+  // offers whichever are. Sequential, one result per unique id, in request order.
   orgRoutes.post('/organizations/:id/portal-users/sso-invite', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', ssoInviteSchema), async (c) => {
     const org = await resolveAccessibleOrg(c);
     if (org instanceof Response) return org;
     const auth = c.get('auth') as AuthContext;
     const ids = [...new Set(c.req.valid('json').portalUserIds)];
     const methods = await resolveInviteSignInMethods(org.id);
-    if (!methods.microsoft) {
-      return c.json({ error: 'Microsoft sign-in is not available for this organization.', code: PORTAL_SSO_INVITE_UNAVAILABLE }, 409);
+    if (!methods.microsoft && !methods.google) {
+      return c.json({ error: 'Single sign-on is not available for this organization.', code: PORTAL_SSO_INVITE_UNAVAILABLE }, 409);
     }
     const orgName = await readOrgName(org.id);
     const results: Array<{ portalUserId: string } & SsoInviteResult> = [];
@@ -867,7 +871,14 @@ export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
     if (await hasPortalUserReferences(target.id)) {
       return c.json({ error: 'This user has ticket or asset history. Disable them instead of deleting.' }, 409);
     }
-    await db.delete(portalUsers).where(eq(portalUsers.id, target.id));
+    // The contact's `portal` role follows the login: removed in the same
+    // transaction as the delete (#11599).
+    await withDbTransaction(async () => {
+      await db.delete(portalUsers).where(eq(portalUsers.id, target.id));
+      if (target.contactId) {
+        await dropPortalRoleForRemovedLogin(db, { orgId: org.id, contactId: target.contactId, actor: { userId: (c.get('auth') as AuthContext).user.id } });
+      }
+    });
     writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.delete', resourceType: 'portal_user', resourceId: target.id, details: { email: target.email } });
     return c.json({ data: { id: target.id, deleted: true } });
   });

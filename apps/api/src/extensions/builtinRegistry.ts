@@ -17,7 +17,7 @@ import {
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
 import remoteAccessExtension from '@cloudcom/ext-rustdesk-access';
-import { createCredentialsExtension } from '@cloudcom/ext-credentials';
+import { createCredentialsExtension, generateCredentialPassword } from '@cloudcom/ext-credentials';
 import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
@@ -262,7 +262,23 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       verifyAuthorization: async input => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.verifyAuthorization(input),
       audit: async event => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.audit(event),
       exchange: async () => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.exchange(),
+      targetedReadCache: {
+        get: async key => (await import('./cloudCommandReadCache')).cloudCommandReadCache.get(key),
+        set: async (key,value,ttl) => (await import('./cloudCommandReadCache')).cloudCommandReadCache.set(key,value,ttl),
+        delete: async key => (await import('./cloudCommandReadCache')).cloudCommandReadCache.delete(key),
+        claim: async (key,ttl) => (await import('./cloudCommandReadCache')).cloudCommandReadCache.claim(key,ttl),
+        release: async (key,token) => (await import('./cloudCommandReadCache')).cloudCommandReadCache.release(key,token),
+        epoch: async (key,rotate) => (await import('./cloudCommandReadCache')).cloudCommandReadCache.epoch(key,rotate),
+        runDetached: (request,work) => { void import('./cloudCommandReadCache').then(m => m.cloudCommandReadCache.runDetached(request,work)).catch(() => console.warn('[CloudCommand] Read cache unavailable')); },
+        withRequestDb: async (request,work) => (await import('./cloudCommandReadCache')).cloudCommandReadCache.withRequestDb(request,work),
+      },
       authorize: async (request, orgId, mutation) => (await import('./cloudCommandAdminAuthorization')).authorizeCloudCommandAdministration(request, orgId, mutation),
+      credentialCapture: {
+        generatePassword: () => generateCredentialPassword(),
+        prepare: async (request,input) => (await import('./cloudCommandCredentialCapture')).cloudCommandCredentialCapture.prepare(request,input),
+        complete: async (request,input) => (await import('./cloudCommandCredentialCapture')).cloudCommandCredentialCapture.complete(request,input),
+        fail: async (request,input) => (await import('./cloudCommandCredentialCapture')).cloudCommandCredentialCapture.fail(request,input),
+      },
     }, {
       version: 1,
       connection: async request => (await import('./cloudCommandGoogle')).nativeGoogleServices.connection(request),

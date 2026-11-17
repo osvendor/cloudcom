@@ -8,10 +8,18 @@
         "apps/api/scripts/cancel-offline-monitor-backlog.lib.ts",
         "apps/api/scripts/cancel-offline-monitor-backlog.ts",
         "apps/api/scripts/credentials-import.ts",
+        "apps/api/scripts/credentials-rebuild-plan.ts",
+        "apps/api/scripts/credentials-rebuild.ts",
         "apps/api/scripts/documentation-import.ts",
         "apps/api/src/config/composeAppVersion.test.ts",
+        "apps/api/src/extensions/builtinRegistry.ts",
         "apps/api/src/extensions/cloudCommandHarmony.test.ts",
         "apps/api/src/extensions/cloudCommandHarmony.ts",
+        "apps/api/src/extensions/cloudCommandReadCache.test.ts",
+        "apps/api/src/extensions/cloudCommandReadCache.ts",
+        "apps/api/src/extensions/credentialsRebuildPlan.test.ts",
+        "apps/api/src/extensions/exchangeBrokerHealth.test.ts",
+        "apps/api/src/extensions/exchangeBrokerHealth.ts",
         "apps/api/src/extensions/harmonyManifest.test.ts",
         "apps/api/src/extensions/harmonySecurity.test.ts",
         "apps/api/src/extensions/harmonySecurity.ts",
@@ -19,6 +27,8 @@
         "apps/api/src/extensions/hostCpuSteal.ts",
         "apps/api/src/extensions/operationsHealth.test.ts",
         "apps/api/src/extensions/operationsHealth.ts",
+        "apps/api/src/jobs/aiTranscriptSweeper.test.ts",
+        "apps/api/src/jobs/aiTranscriptSweeper.ts",
         "apps/api/src/jobs/alertWorkTelemetry.test.ts",
         "apps/api/src/jobs/alertWorkTelemetry.ts",
         "apps/api/src/jobs/alertWorker.test.ts",
@@ -177,16 +187,21 @@
         "apps/api/src/services/workerRegistry.test.ts",
         "apps/api/src/services/workerRegistry.ts",
         "apps/api/src/system/connections/internalEnvVars.ts",
-        "apps/api/src/worker.ts"
+        "apps/api/src/worker.ts",
+        "apps/api/tsup.config.ts"
       ],
       "tests": [
         "apps/api/scripts/cancel-offline-monitor-backlog.lib.test.ts",
         "apps/api/src/config/composeAppVersion.test.ts",
         "apps/api/src/extensions/cloudCommandHarmony.test.ts",
+        "apps/api/src/extensions/cloudCommandReadCache.test.ts",
+        "apps/api/src/extensions/credentialsRebuildPlan.test.ts",
+        "apps/api/src/extensions/exchangeBrokerHealth.test.ts",
         "apps/api/src/extensions/harmonyManifest.test.ts",
         "apps/api/src/extensions/harmonySecurity.test.ts",
         "apps/api/src/extensions/hostCpuSteal.test.ts",
         "apps/api/src/extensions/operationsHealth.test.ts",
+        "apps/api/src/jobs/aiTranscriptSweeper.test.ts",
         "apps/api/src/jobs/alertWorkTelemetry.test.ts",
         "apps/api/src/jobs/alertWorker.test.ts",
         "apps/api/src/jobs/cloudCommandM365SnapshotWorker.test.ts",
@@ -362,6 +377,10 @@
             "src/services/workerEntrypointClosure.contract.test.ts",
             "src/services/workerRegistry.startupConcurrency.test.ts",
             "src/services/workerRegistry.test.ts",
+            "src/extensions/cloudCommandReadCache.test.ts",
+            "src/extensions/credentialsRebuildPlan.test.ts",
+            "src/extensions/exchangeBrokerHealth.test.ts",
+            "src/jobs/aiTranscriptSweeper.test.ts",
             "--maxWorkers=1"
           ],
           "cwd": "apps/api"
@@ -383,6 +402,7 @@
         "apps/api/migrations/2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql",
         "apps/api/migrations/2026-10-14-233000-cloudcom-policy-planner-statistics.sql",
         "apps/api/migrations/2026-10-15-harmony-integrations.sql",
+        "apps/api/src/__tests__/integration/cloudCommandCredentialCapture.integration.test.ts",
         "apps/api/src/__tests__/integration/harmonyPublication.integration.test.ts",
         "apps/api/src/__tests__/integration/harmonyRls.integration.test.ts",
         "apps/api/src/__tests__/integration/rls-coverage.integration.test.ts",
@@ -402,6 +422,8 @@
         "apps/api/src/db/schema/staffNative.ts",
         "apps/api/src/db/schemaFreeRequestDatabase.test.ts",
         "apps/api/src/db/seed.ts",
+        "apps/api/src/extensions/cloudCommandCredentialCapture.test.ts",
+        "apps/api/src/extensions/cloudCommandCredentialCapture.ts",
         "apps/api/src/routes/staffNative.test.ts",
         "apps/api/src/routes/staffNative.ts",
         "apps/api/src/services/agentRolloutAdmission.redis.test.ts",
@@ -417,9 +439,11 @@
         "apps/api/src/services/staffNativeDirectory.ts",
         "apps/api/src/services/staffNativeLogin.test.ts",
         "apps/api/src/services/staffNativeLogin.ts",
-        "apps/api/vitest.config.cloudcom-reviewed-db.ts"
+        "apps/api/vitest.config.cloudcom-reviewed-db.ts",
+        "packages/ext-credentials/migrations/0004_credential_drafts.sql"
       ],
       "tests": [
+        "apps/api/src/__tests__/integration/cloudCommandCredentialCapture.integration.test.ts",
         "apps/api/src/__tests__/integration/harmonyPublication.integration.test.ts",
         "apps/api/src/__tests__/integration/harmonyRls.integration.test.ts",
         "apps/api/src/__tests__/integration/rls-coverage.integration.test.ts",
@@ -431,6 +455,7 @@
         "apps/api/src/db/preparedPolicyReads.test.ts",
         "apps/api/src/db/prologueDeadlineWiring.test.ts",
         "apps/api/src/db/schemaFreeRequestDatabase.test.ts",
+        "apps/api/src/extensions/cloudCommandCredentialCapture.test.ts",
         "apps/api/src/routes/staffNative.test.ts",
         "apps/api/src/services/agentRolloutAdmission.redis.test.ts",
         "apps/api/src/services/deviceIdentity.pg.test.ts",
@@ -458,6 +483,7 @@
             "src/services/staffNativeAvailability.test.ts",
             "src/services/staffNativeDirectory.test.ts",
             "src/services/staffNativeLogin.test.ts",
+            "src/extensions/cloudCommandCredentialCapture.test.ts",
             "--maxWorkers=1"
           ],
           "cwd": "apps/api"
@@ -486,6 +512,8 @@
         "packages/browser-companion/package.json",
         "packages/browser-companion/policy.js",
         "packages/browser-companion/policy.test.mjs",
+        "packages/browser-companion/popup-credentials.js",
+        "packages/browser-companion/popup-credentials.test.mjs",
         "packages/browser-companion/popup-navigation.test.mjs",
         "packages/browser-companion/popup-notes.js",
         "packages/browser-companion/popup-notes.test.mjs",
@@ -529,6 +557,7 @@
         "packages/browser-companion/background.test.mjs",
         "packages/browser-companion/device-user.test.mjs",
         "packages/browser-companion/policy.test.mjs",
+        "packages/browser-companion/popup-credentials.test.mjs",
         "packages/browser-companion/popup-navigation.test.mjs",
         "packages/browser-companion/popup-notes.test.mjs",
         "packages/browser-companion/popup-work.test.mjs",
@@ -565,12 +594,17 @@
         "packages/ext-credentials/package.json",
         "packages/ext-credentials/src/import/documentSections.test.ts",
         "packages/ext-credentials/src/import/documentSections.ts",
+        "packages/ext-credentials/src/import/extractNoteCredentials.test.ts",
+        "packages/ext-credentials/src/import/extractNoteCredentials.ts",
         "packages/ext-credentials/src/import/itGlue.test.ts",
         "packages/ext-credentials/src/import/itGlue.ts",
         "packages/ext-credentials/src/import/mapping.test.ts",
         "packages/ext-credentials/src/import/mapping.ts",
+        "packages/ext-credentials/src/import/normalize.test.ts",
+        "packages/ext-credentials/src/import/normalize.ts",
         "packages/ext-credentials/src/server/browserCompanion.test.ts",
         "packages/ext-credentials/src/server/browserCompanion.ts",
+        "packages/ext-credentials/src/server/credentialDrafts.ts",
         "packages/ext-credentials/src/server/documentImages.test.ts",
         "packages/ext-credentials/src/server/documentImages.ts",
         "packages/ext-credentials/src/server/documentSecrets.test.ts",
@@ -579,6 +613,8 @@
         "packages/ext-credentials/src/server/documents.ts",
         "packages/ext-credentials/src/server/index.test.ts",
         "packages/ext-credentials/src/server/index.ts",
+        "packages/ext-credentials/src/server/passwordGenerator.test.ts",
+        "packages/ext-credentials/src/server/passwordGenerator.ts",
         "packages/ext-credentials/src/server/secrets.test.ts",
         "packages/ext-credentials/src/server/secrets.ts",
         "packages/ext-credentials/src/server/totp.test.ts",
@@ -596,13 +632,16 @@
       ],
       "tests": [
         "packages/ext-credentials/src/import/documentSections.test.ts",
+        "packages/ext-credentials/src/import/extractNoteCredentials.test.ts",
         "packages/ext-credentials/src/import/itGlue.test.ts",
         "packages/ext-credentials/src/import/mapping.test.ts",
+        "packages/ext-credentials/src/import/normalize.test.ts",
         "packages/ext-credentials/src/server/browserCompanion.test.ts",
         "packages/ext-credentials/src/server/documentImages.test.ts",
         "packages/ext-credentials/src/server/documentSecrets.test.ts",
         "packages/ext-credentials/src/server/documents.test.ts",
         "packages/ext-credentials/src/server/index.test.ts",
+        "packages/ext-credentials/src/server/passwordGenerator.test.ts",
         "packages/ext-credentials/src/server/secrets.test.ts",
         "packages/ext-credentials/src/server/totp.test.ts",
         "packages/ext-credentials/src/web/browserCompanion.test.ts",
@@ -656,12 +695,36 @@
         "packages/ext-cloud-command/migrations/2026-09-25-microsoft-onboarding-tenant-discovery.sql",
         "packages/ext-cloud-command/migrations/2026-10-13-idrive360.sql",
         "packages/ext-cloud-command/migrations/2026-10-15-harmony.sql",
-        "packages/ext-cloud-command/src/microsoft-sku-names.ts"
+        "packages/ext-cloud-command/src/microsoft-sku-names.ts",
+        "packages/ext-cloud-command/src/server/admin-execution.test.ts",
+        "packages/ext-cloud-command/src/server/admin-execution.ts",
+        "packages/ext-cloud-command/src/server/admin-graph-provider.test.ts",
+        "packages/ext-cloud-command/src/server/admin-graph-provider.ts",
+        "packages/ext-cloud-command/src/server/admin-runtime.ts",
+        "packages/ext-cloud-command/src/server/admin-services.test.ts",
+        "packages/ext-cloud-command/src/server/admin-services.ts",
+        "packages/ext-cloud-command/src/server/directory-snapshot-store.test.ts",
+        "packages/ext-cloud-command/src/server/directory-snapshot-store.ts",
+        "packages/ext-cloud-command/src/server/directory-snapshots.test.ts",
+        "packages/ext-cloud-command/src/server/directory-snapshots.ts",
+        "packages/ext-cloud-command/src/server/exchange-read-cache.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-read-cache.ts",
+        "packages/ext-cloud-command/src/server/index.ts",
+        "packages/ext-cloud-command/src/server/microsoft.ts",
+        "packages/ext-cloud-command/src/web/microsoft.test.ts",
+        "packages/ext-cloud-command/src/web/microsoft.ts"
       ],
       "tests": [
-        "packages/ext-cloud-command/src/server/harmony.test.ts",
+        "packages/ext-cloud-command/src/server/admin-execution.test.ts",
+        "packages/ext-cloud-command/src/server/admin-graph-provider.test.ts",
+        "packages/ext-cloud-command/src/server/admin-services.test.ts",
+        "packages/ext-cloud-command/src/server/directory-layouts.migration.test.ts",
+        "packages/ext-cloud-command/src/server/directory-snapshot-store.test.ts",
         "packages/ext-cloud-command/src/server/directory-snapshots.migration.test.ts",
-        "packages/ext-cloud-command/src/server/directory-layouts.migration.test.ts"
+        "packages/ext-cloud-command/src/server/directory-snapshots.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-read-cache.test.ts",
+        "packages/ext-cloud-command/src/server/harmony.test.ts",
+        "packages/ext-cloud-command/src/web/microsoft.test.ts"
       ],
       "commands": [
         {
@@ -679,6 +742,15 @@
             "--filter",
             "@cloudcom/ext-cloud-command",
             "test"
+          ],
+          "cwd": "."
+        },
+        {
+          "program": "pnpm",
+          "args": [
+            "--filter",
+            "@cloudcom/ext-cloud-command",
+            "test:server"
           ],
           "cwd": "."
         },
@@ -859,7 +931,11 @@
     },
     "release-artifacts": {
       "paths": [
+        "deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml",
+        "deploy/cloudcom-exchange-worker/verify-compose-candidate.py",
         "docker/Dockerfile.api.dev",
+        "scripts/cloudcom/exchange-worker.py",
+        "scripts/cloudcom/exchange-worker.test.py",
         "scripts/release/cloudcom-release-versions.mjs",
         "scripts/release/cloudcom-release-versions.test.mjs",
         "scripts/release/feature-artifact.mjs",
@@ -870,6 +946,7 @@
         "scripts/release/promote-feature-artifact.sh"
       ],
       "tests": [
+        "scripts/cloudcom/exchange-worker.test.py",
         "scripts/release/cloudcom-release-versions.test.mjs",
         "scripts/release/feature-artifact.test.mjs",
         "scripts/release/package-viewer-windows-updater.test.mjs"
@@ -897,6 +974,13 @@
           "args": [
             "-n",
             "scripts/release/promote-feature-artifact.sh"
+          ],
+          "cwd": "."
+        },
+        {
+          "program": "python3",
+          "args": [
+            "scripts/cloudcom/exchange-worker.test.py"
           ],
           "cwd": "."
         }
