@@ -37,6 +37,7 @@
         "apps/api/src/jobs/cloudCommandM365SnapshotWorker.ts",
         "apps/api/src/jobs/harmonySyncWorker.test.ts",
         "apps/api/src/jobs/harmonySyncWorker.ts",
+        "apps/api/src/jobs/metricRollupWorkAdmission.redis.test.ts",
         "apps/api/src/jobs/metricRollupWorkAdmission.test.ts",
         "apps/api/src/jobs/metricRollupWorkAdmission.ts",
         "apps/api/src/jobs/metricRollups.test.ts",
@@ -189,7 +190,8 @@
         "apps/api/src/services/workerRegistry.ts",
         "apps/api/src/system/connections/internalEnvVars.ts",
         "apps/api/src/worker.ts",
-        "apps/api/tsup.config.ts"
+        "apps/api/tsup.config.ts",
+        "scripts/cloudcom/test-rollup-redis.sh"
       ],
       "tests": [
         "apps/api/scripts/cancel-offline-monitor-backlog.lib.test.ts",
@@ -207,6 +209,7 @@
         "apps/api/src/jobs/alertWorker.test.ts",
         "apps/api/src/jobs/cloudCommandM365SnapshotWorker.test.ts",
         "apps/api/src/jobs/harmonySyncWorker.test.ts",
+        "apps/api/src/jobs/metricRollupWorkAdmission.redis.test.ts",
         "apps/api/src/jobs/metricRollupWorkAdmission.test.ts",
         "apps/api/src/jobs/metricRollups.test.ts",
         "apps/api/src/jobs/monitorScriptWorker.test.ts",
@@ -303,6 +306,7 @@
             "src/jobs/alertWorker.test.ts",
             "src/jobs/cloudCommandM365SnapshotWorker.test.ts",
             "src/jobs/harmonySyncWorker.test.ts",
+            "src/jobs/metricRollupWorkAdmission.redis.test.ts",
             "src/jobs/metricRollupWorkAdmission.test.ts",
             "src/jobs/metricRollups.test.ts",
             "src/jobs/monitorScriptWorker.test.ts",
@@ -396,6 +400,13 @@
             "build"
           ],
           "cwd": "."
+        },
+        {
+          "program": "bash",
+          "cwd": ".",
+          "args": [
+            "scripts/cloudcom/test-rollup-redis.sh"
+          ]
         }
       ]
     },

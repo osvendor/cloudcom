@@ -166,10 +166,10 @@ async function processRollupOrgRange(data: RollupOrgRangeJobData): Promise<Metri
 export function createMetricRollupsWorker(): Worker<MetricRollupJobData> {
   return new Worker<MetricRollupJobData>(
     METRIC_ROLLUPS_QUEUE,
-    async (job: Job<MetricRollupJobData>, token?: string) => {
-      if (job.data.type === 'scan-orgs') {
-        return processScanOrgs(job.data);
-      }
+    async (job: Job<MetricRollupJobData>) => {
+      // Shared capacity cooldown also gates fan-out. The scan still uses a
+      // 15-minute execution-time lookback: longer pauses require explicit
+      // bounded catch-up; this change does not create a historical cursor.
       const data = job.data;
       // No worker-level system context here (#4276): rollupDeviceMetricsRange
       // owns one short-lived labeled context PER statement, each preceded by
@@ -178,11 +178,15 @@ export function createMetricRollupsWorker(): Worker<MetricRollupJobData> {
       // connection for the whole pass (an unlabeled hold, plus a second pool
       // slot). This outer runOutsideDbContext is belt-and-braces against a
       // future ambient context on this path.
-      return runOutsideDbContext(() => runMetricRollupWork(job, token, () => processRollupOrgRange(data)));
+      return runOutsideDbContext(() => runMetricRollupWork(
+        job, durationMs => getMetricRollupsQueue().rateLimit(durationMs),
+        () => data.type === 'scan-orgs' ? processScanOrgs(data) : processRollupOrgRange(data),
+      ));
     },
     {
       connection: getBullMQConnection(),
       concurrency: readMetricRollupConcurrency(),
+      limiter: { max: 1, duration: 1000 },
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -217,7 +221,7 @@ async function scheduleMetricRollupsScan(): Promise<void> {
 export async function initializeMetricRollupsWorker(): Promise<void> {
   // A per-process limit is insufficient when multiple API/worker replicas run.
   // Do this before starting the consumer, so there is no unconstrained boot gap.
-  await getMetricRollupsQueue().setGlobalConcurrency(readMetricRollupConcurrency());
+  await getMetricRollupsQueue().setGlobalConcurrency(1);
   metricRollupsWorker = createMetricRollupsWorker();
   attachWorkerObservability(metricRollupsWorker, 'metricRollupsWorker');
   metricRollupsWorker.on('error', (error) => {

@@ -819,7 +819,9 @@
         "apps/api/src/jobs/monitorScriptWorker.test.ts",
         "apps/api/src/jobs/cloudCommandM365SnapshotWorker.test.ts",
         "agent/internal/unifi/collector_backoff.go",
-        "agent/internal/unifi/collector_backoff_test.go"
+        "agent/internal/unifi/collector_backoff_test.go",
+        "apps/api/src/jobs/metricRollupWorkAdmission.redis.test.ts",
+        "scripts/cloudcom/test-rollup-redis.sh"
       ],
       "hooks": [
         {
@@ -832,11 +834,11 @@
         },
         {
           "file": "apps/api/src/jobs/metricRollups.ts",
-          "contains": "runMetricRollupWork(job, token"
+          "contains": "job, durationMs => getMetricRollupsQueue().rateLimit(durationMs)"
         },
         {
           "file": "apps/api/src/jobs/metricRollups.ts",
-          "contains": "setGlobalConcurrency(readMetricRollupConcurrency())"
+          "contains": "setGlobalConcurrency(1)"
         },
         {
           "file": "apps/api/src/jobs/monitorScriptWorker.ts",
@@ -877,6 +879,18 @@
         {
           "file": "agent/internal/unifi/collector.go",
           "contains": "lastFetch.Sub(lastErrorLog) >= fetchErrorLogInterval"
+        },
+        {
+          "file": "apps/api/src/jobs/metricRollups.ts",
+          "contains": "limiter: { max: 1, duration: 1000 }"
+        },
+        {
+          "file": "apps/api/src/jobs/metricRollupWorkAdmission.ts",
+          "contains": "await rateLimit(60_000)"
+        },
+        {
+          "file": "apps/api/src/jobs/metricRollupWorkAdmission.ts",
+          "contains": "throw Worker.RateLimitError()"
         }
       ]
     },
